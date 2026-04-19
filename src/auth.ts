@@ -144,6 +144,7 @@ function buildScopesFromEndpoints(
   readOnly: boolean = false
 ): string[] {
   const scopesSet = new Set<string>();
+  scopesSet.add('offline_access');
 
   // Create regex for tool filtering if pattern is provided
   let enabledToolsRegex: RegExp | undefined;
