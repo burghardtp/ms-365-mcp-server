@@ -267,14 +267,20 @@ class MicrosoftGraphServer {
         const state = url.searchParams.get('state');
 
         // Forward parameters that Microsoft OAuth 2.0 v2.0 supports,
-        // but NOT code_challenge/code_challenge_method — we generate our own for Microsoft
+        // but NOT code_challenge/code_challenge_method — we generate our own for Microsoft.
+        // NOTE: `prompt` is intentionally stripped. Claude sends `prompt=consent`, which
+        // forces Microsoft to show a user-consent screen on every sign-in. In tenants that
+        // disallow user consent (common for business tenants), this routes the user into
+        // the admin consent request workflow EVEN WHEN tenant-wide admin consent has
+        // already been granted — creating an infinite "Request approval" loop. Stripping
+        // `prompt` lets Microsoft honor the existing admin consent and complete sign-in
+        // silently. See project_m365_prompt_consent_fix memory for full debug history.
         const allowedParams = [
           'response_type',
           'redirect_uri',
           'scope',
           'state',
           'response_mode',
-          'prompt',
           'login_hint',
           'domain_hint',
         ];
