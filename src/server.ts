@@ -11,6 +11,7 @@ import AuthManager, { buildScopesFromEndpoints } from './auth.js';
 import { MicrosoftOAuthProvider } from './oauth-provider.js';
 import {
   exchangeCodeForToken,
+  getClientSecretForRedirect,
   microsoftBearerTokenAuthMiddleware,
   refreshAccessToken,
 } from './lib/microsoft-auth.js';
@@ -379,14 +380,16 @@ class MicrosoftGraphServer {
             const tenantId = this.secrets?.tenantId || 'common';
             const clientId = this.secrets!.clientId;
             const clientSecret = this.secrets?.clientSecret;
+            const redirectUri = body.redirect_uri as string | undefined;
+            const tokenExchangeClientSecret = getClientSecretForRedirect(redirectUri, clientSecret);
 
             logger.info('Token endpoint: authorization_code exchange', {
-              redirect_uri: body.redirect_uri,
+              redirect_uri: redirectUri,
               has_code: !!body.code,
               has_code_verifier: !!body.code_verifier,
               clientId,
               tenantId,
-              hasClientSecret: !!clientSecret,
+              hasClientSecret: !!tokenExchangeClientSecret,
             });
 
             // Two-leg PKCE: check if we have a stored PKCE mapping for this exchange
@@ -418,9 +421,9 @@ class MicrosoftGraphServer {
 
             const result = await exchangeCodeForToken(
               body.code as string,
-              body.redirect_uri as string,
+              redirectUri as string,
               clientId,
-              clientSecret,
+              tokenExchangeClientSecret,
               tenantId,
               serverCodeVerifier || (body.code_verifier as string | undefined),
               this.secrets!.cloudType

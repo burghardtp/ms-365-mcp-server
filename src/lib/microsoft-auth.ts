@@ -3,6 +3,33 @@ import logger from '../logger.js';
 import { getCloudEndpoints, type CloudType } from '../cloud-config.js';
 
 /**
+ * Loopback redirects are native/public-client OAuth flows in Microsoft Entra ID.
+ * When redeeming those codes, sending a client_secret can make Entra reject the
+ * token exchange even though browser authorization succeeded.
+ */
+export function getClientSecretForRedirect(
+  redirectUri: string | undefined,
+  clientSecret: string | undefined
+): string | undefined {
+  if (!redirectUri || !clientSecret) {
+    return clientSecret;
+  }
+
+  try {
+    const parsed = new URL(redirectUri);
+    const host = parsed.hostname.toLowerCase();
+
+    if (parsed.protocol === 'http:' && (host === 'localhost' || host === '127.0.0.1')) {
+      return undefined;
+    }
+  } catch {
+    return clientSecret;
+  }
+
+  return clientSecret;
+}
+
+/**
  * Microsoft Bearer Token Auth Middleware validates that the request has a valid Microsoft access token
  * The token is passed in the Authorization header as a Bearer token
  */
