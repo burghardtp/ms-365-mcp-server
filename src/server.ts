@@ -15,11 +15,14 @@ import {
   microsoftBearerTokenAuthMiddleware,
   refreshAccessToken,
 } from './lib/microsoft-auth.js';
+import { getPkceChallenge, getPublicBaseUrl, isLoopbackRedirectUri } from './lib/oauth-proxy.js';
 import type { CommandOptions } from './cli.ts';
 import { getSecrets, type AppSecrets } from './secrets.js';
 import { getCloudEndpoints } from './cloud-config.js';
 import { requestContext } from './request-context.js';
 import crypto from 'node:crypto';
+
+type TokenExchangeResult = Awaited<ReturnType<typeof exchangeCodeForToken>>;
 
 /**
  * Parse HTTP option into host and port components.
@@ -64,6 +67,18 @@ class MicrosoftGraphServer {
       clientCodeChallenge: string;
       clientCodeChallengeMethod: string;
       serverCodeVerifier: string;
+      clientRedirectUri?: string;
+      microsoftRedirectUri?: string;
+      createdAt: number;
+    }
+  > = new Map();
+
+  private proxiedCodeStore: Map<
+    string,
+    {
+      tokens: TokenExchangeResult;
+      clientCodeChallenge: string;
+      clientCodeChallengeMethod: string;
       createdAt: number;
     }
   > = new Map();
@@ -110,6 +125,20 @@ class MicrosoftGraphServer {
     }
 
     return server;
+  }
+
+  private cleanupOAuthStores(now = Date.now()): void {
+    for (const [key, value] of this.pkceStore) {
+      if (now - value.createdAt > 10 * 60 * 1000) {
+        this.pkceStore.delete(key);
+      }
+    }
+
+    for (const [key, value] of this.proxiedCodeStore) {
+      if (now - value.createdAt > 10 * 60 * 1000) {
+        this.proxiedCodeStore.delete(key);
+      }
+    }
   }
 
   async initialize(version: string): Promise<void> {
@@ -266,6 +295,23 @@ class MicrosoftGraphServer {
         const clientCodeChallenge = url.searchParams.get('code_challenge');
         const clientCodeChallengeMethod = url.searchParams.get('code_challenge_method');
         const state = url.searchParams.get('state');
+        const clientRedirectUri = url.searchParams.get('redirect_uri');
+        const shouldProxyLoopback = isLoopbackRedirectUri(clientRedirectUri);
+
+        if (shouldProxyLoopback && (!clientCodeChallenge || !state || !clientRedirectUri)) {
+          res.status(400).json({
+            error: 'invalid_request',
+            error_description: 'Loopback OAuth requires redirect_uri, state, and PKCE challenge',
+          });
+          return;
+        }
+
+        const microsoftRedirectUri = shouldProxyLoopback
+          ? `${getPublicBaseUrl(
+              req,
+              this.options.baseUrl || process.env.MS365_MCP_BASE_URL
+            )}/auth/callback`
+          : undefined;
 
         // Forward parameters that Microsoft OAuth 2.0 v2.0 supports,
         // but NOT code_challenge/code_challenge_method — we generate our own for Microsoft.
@@ -306,16 +352,12 @@ class MicrosoftGraphServer {
             clientCodeChallenge,
             clientCodeChallengeMethod: clientCodeChallengeMethod || 'S256',
             serverCodeVerifier,
+            clientRedirectUri: shouldProxyLoopback ? clientRedirectUri || undefined : undefined,
+            microsoftRedirectUri,
             createdAt: Date.now(),
           });
 
-          // Clean up entries older than 10 minutes
-          const now = Date.now();
-          for (const [key, value] of this.pkceStore) {
-            if (now - value.createdAt > 10 * 60 * 1000) {
-              this.pkceStore.delete(key);
-            }
-          }
+          this.cleanupOAuthStores();
 
           // Send our server-generated code_challenge to Microsoft
           microsoftAuthUrl.searchParams.set('code_challenge', serverCodeChallenge);
@@ -335,6 +377,10 @@ class MicrosoftGraphServer {
         // Use our Microsoft app's client_id
         microsoftAuthUrl.searchParams.set('client_id', clientId);
 
+        if (microsoftRedirectUri) {
+          microsoftAuthUrl.searchParams.set('redirect_uri', microsoftRedirectUri);
+        }
+
         // Ensure we have the minimal required scopes if none provided
         if (!microsoftAuthUrl.searchParams.get('scope')) {
           microsoftAuthUrl.searchParams.set('scope', 'User.Read Files.Read Mail.Read');
@@ -342,6 +388,76 @@ class MicrosoftGraphServer {
 
         // Redirect to Microsoft's authorization page
         res.redirect(microsoftAuthUrl.toString());
+      });
+
+      app.get('/auth/callback', async (req, res) => {
+        try {
+          const url = new URL(req.url!, `${req.protocol}://${req.get('host')}`);
+          const state = url.searchParams.get('state');
+          const error = url.searchParams.get('error');
+          const code = url.searchParams.get('code');
+          const pkceData = state ? this.pkceStore.get(state) : undefined;
+
+          if (!state || !pkceData?.clientRedirectUri || !pkceData.microsoftRedirectUri) {
+            res.status(400).json({
+              error: 'invalid_request',
+              error_description: 'OAuth state is missing or expired',
+            });
+            return;
+          }
+
+          const clientRedirectUrl = new URL(pkceData.clientRedirectUri);
+
+          if (error) {
+            clientRedirectUrl.searchParams.set('error', error);
+            const errorDescription = url.searchParams.get('error_description');
+            if (errorDescription) {
+              clientRedirectUrl.searchParams.set('error_description', errorDescription);
+            }
+            clientRedirectUrl.searchParams.set('state', state);
+            this.pkceStore.delete(state);
+            res.redirect(clientRedirectUrl.toString());
+            return;
+          }
+
+          if (!code) {
+            res.status(400).json({
+              error: 'invalid_request',
+              error_description: 'Microsoft authorization code is missing',
+            });
+            return;
+          }
+
+          const result = await exchangeCodeForToken(
+            code,
+            pkceData.microsoftRedirectUri,
+            this.secrets!.clientId,
+            this.secrets?.clientSecret,
+            this.secrets?.tenantId || 'common',
+            pkceData.serverCodeVerifier,
+            this.secrets!.cloudType
+          );
+
+          const proxiedCode = crypto.randomBytes(32).toString('base64url');
+          this.proxiedCodeStore.set(proxiedCode, {
+            tokens: result,
+            clientCodeChallenge: pkceData.clientCodeChallenge,
+            clientCodeChallengeMethod: pkceData.clientCodeChallengeMethod,
+            createdAt: Date.now(),
+          });
+          this.pkceStore.delete(state);
+          this.cleanupOAuthStores();
+
+          clientRedirectUrl.searchParams.set('code', proxiedCode);
+          clientRedirectUrl.searchParams.set('state', state);
+          res.redirect(clientRedirectUrl.toString());
+        } catch (error) {
+          logger.error('OAuth callback error:', error);
+          res.status(500).json({
+            error: 'server_error',
+            error_description: 'Internal server error during OAuth callback',
+          });
+        }
       });
 
       // Token exchange endpoint
@@ -391,6 +507,27 @@ class MicrosoftGraphServer {
               tenantId,
               hasClientSecret: !!tokenExchangeClientSecret,
             });
+
+            const proxiedCode = this.proxiedCodeStore.get(body.code as string);
+            if (proxiedCode) {
+              const codeVerifier = body.code_verifier as string | undefined;
+              const clientChallenge = codeVerifier
+                ? getPkceChallenge(codeVerifier, proxiedCode.clientCodeChallengeMethod)
+                : undefined;
+
+              if (!clientChallenge || clientChallenge !== proxiedCode.clientCodeChallenge) {
+                logger.error('Token endpoint: proxied PKCE verifier mismatch');
+                res.status(400).json({
+                  error: 'invalid_grant',
+                  error_description: 'PKCE verifier is invalid',
+                });
+                return;
+              }
+
+              this.proxiedCodeStore.delete(body.code as string);
+              res.json(proxiedCode.tokens);
+              return;
+            }
 
             // Two-leg PKCE: check if we have a stored PKCE mapping for this exchange
             // We need to find the matching state — it's not sent in the token request,
