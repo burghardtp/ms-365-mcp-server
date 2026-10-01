@@ -770,7 +770,11 @@ class MicrosoftGraphServer {
           'scope',
           'state',
           'response_mode',
-          'prompt',
+          // `prompt` is intentionally not forwarded. Claude sends `prompt=consent`, which
+          // forces a user-consent screen on every sign-in. In tenants that disallow user
+          // consent this routes the user into the admin consent request workflow even when
+          // tenant-wide admin consent has already been granted (an endless "Request
+          // approval" loop). Dropping it lets Microsoft honor the existing admin consent.
           'login_hint',
           'domain_hint',
         ];
