@@ -1,0 +1,912 @@
+/**
+ * Firm file tools: move bytes between Outlook mail and OneDrive or SharePoint
+ * entirely inside the server, Graph to Graph. No tool here ever returns file
+ * bytes (base64 or otherwise) to the caller; each returns the ids, names, sizes,
+ * and links of what it wrote.
+ *
+ * Tools:
+ *   save_attachment_to_drive         mail attachment -> drive folder
+ *   attach_drive_file_to_draft       drive file -> draft message attachment
+ *   attach_mail_attachment_to_draft  mail attachment -> draft message attachment
+ *   find_matter_folder               search the Matters tree two levels deep
+ *
+ * Every call writes one log line: { ts, tool, source, destination, size }.
+ */
+import { z } from 'zod';
+import logger from './logger.js';
+import { getUserIdentityForAudit } from './audit-log.js';
+import { getGraphBaseUrl } from './cloud-config.js';
+import type GraphClient from './graph-client.js';
+import type { UtilityTool, UtilityToolContext } from './graph-tools.js';
+import {
+  fetchWithResilience,
+  getSharedBreaker,
+  loadResilienceConfig,
+} from './lib/graph-resilience.js';
+import { getRequestTokens } from './request-context.js';
+
+const MB = 1024 * 1024;
+/** Largest file any tool here will move (the Graph upload session ceiling for attachments). */
+export const FILE_OPS_MAX_BYTES = 150 * MB;
+/** Drive uploads below this size use a single PUT; at or above it, an upload session. */
+export const DRIVE_SIMPLE_UPLOAD_MAX_BYTES = 4 * MB;
+/** Mail attachments below this size are POSTed inline; at or above it, an upload session. */
+export const MAIL_INLINE_ATTACHMENT_MAX_BYTES = 3 * MB;
+/**
+ * Upload session chunk size. Drive sessions require a multiple of 320 KiB; Outlook
+ * attachment sessions require each range to be under 4 MB. 10 x 320 KiB meets both.
+ */
+export const UPLOAD_CHUNK_BYTES = 320 * 1024 * 10;
+
+export const DEFAULT_MATTERS_DRIVE_ID =
+  'b!m2Rv4o9xZE-3OoioO8WFPI4O6eEnFgZIgL385_dGYq9KvqgnJ-TBTqHv8y1m3SlH';
+export const DEFAULT_MATTERS_ROOT_PATH = 'GC Associates/Matters';
+
+const CONFLICT_BEHAVIORS = ['rename', 'fail', 'replace'] as const;
+type ConflictBehavior = (typeof CONFLICT_BEHAVIORS)[number];
+
+interface ToolResult {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+  [key: string]: unknown;
+}
+
+/** A failure the tool reports to the caller as a plain, clear message. */
+class FileOpsError extends Error {}
+
+function ok(payload: unknown): ToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+}
+
+function fail(message: string): ToolResult {
+  return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true };
+}
+
+function logOp(tool: string, source: string, destination: string, size: number | null): void {
+  logger.info(
+    `[file-ops] ${JSON.stringify({ ts: new Date().toISOString(), tool, source, destination, size })}`
+  );
+}
+
+/**
+ * Strip the characters SharePoint and OneDrive refuse in a file name
+ * (: # % < > " | ? * plus the path separators / and \ and control characters),
+ * collapse runs of whitespace, and drop leading and trailing spaces and dots.
+ */
+export function sharePointSafeName(name: string): string {
+  const cleaned = name
+    .split('')
+    .filter((ch) => {
+      const code = ch.charCodeAt(0);
+      if (code < 32 || code === 127) return false;
+      return !':#%<>"|?*/\\'.includes(ch);
+    })
+    .join('')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s.]+|[\s.]+$/g, '');
+  return cleaned;
+}
+
+function enc(id: string): string {
+  return encodeURIComponent(id);
+}
+
+function encodePath(p: string): string {
+  return p
+    .split('/')
+    .filter((s) => s.length > 0)
+    .map((s) => encodeURIComponent(s))
+    .join('/');
+}
+
+function statusOf(error: unknown): number | undefined {
+  const e = error as { httpStatus?: unknown; message?: unknown };
+  if (typeof e?.httpStatus === 'number') return e.httpStatus;
+  const m = typeof e?.message === 'string' ? e.message.match(/API error: (\d{3})\b/) : null;
+  return m ? Number(m[1]) : undefined;
+}
+
+/** Turn a Graph failure into a message that names the thing that was not found or refused. */
+function describe(error: unknown, what: string): string {
+  if (error instanceof FileOpsError) return error.message;
+  const status = statusOf(error);
+  const raw = (error as Error)?.message ?? String(error);
+  if (status === 404) return `${what} was not found (Graph 404). Check the id. Detail: ${raw}`;
+  if (status === 403) return `Access to ${what} was refused (Graph 403). Detail: ${raw}`;
+  if (status === 401)
+    return `The access token was rejected (Graph 401). Sign in again. Detail: ${raw}`;
+  return raw;
+}
+
+/**
+ * Resolve the Graph token for this call the same way download-bytes does: the
+ * request-scoped bearer token in HTTP/OAuth mode, the selected cached account in
+ * stdio mode. A missing token is refused before any Graph call.
+ */
+async function resolveToken(ctx: UtilityToolContext, account: string | undefined): Promise<string> {
+  const { authManager } = ctx;
+  const contextToken = getRequestTokens()?.accessToken;
+  try {
+    if (account && authManager && (contextToken || authManager.isOAuthModeEnabled())) {
+      const bearer = contextToken ?? (await authManager.getToken().catch(() => null)) ?? undefined;
+      const identity = getUserIdentityForAudit(bearer);
+      if (!identity || identity.toLowerCase() !== account.toLowerCase()) {
+        throw new FileOpsError(
+          `The 'account' parameter is not supported in HTTP/OAuth mode: every request uses the identity of the connecting client's bearer token${identity ? ` ('${identity}')` : ''}.`
+        );
+      }
+    }
+    let token: string | null | undefined;
+    if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+      token = await authManager.getTokenForAccount(account);
+    } else {
+      token = contextToken ?? (authManager ? await authManager.getToken() : undefined);
+    }
+    if (!token) throw new FileOpsError('missing');
+    return token;
+  } catch (error) {
+    if (error instanceof FileOpsError && error.message !== 'missing') throw error;
+    throw new FileOpsError(
+      'No Microsoft Graph access token is available for this request. Sign in to the connector again, then retry.'
+    );
+  }
+}
+
+async function graphJson<T>(
+  graph: GraphClient,
+  token: string,
+  endpoint: string,
+  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {}
+): Promise<T> {
+  const body =
+    options.body === undefined
+      ? undefined
+      : typeof options.body === 'string' || Buffer.isBuffer(options.body)
+        ? (options.body as string | Buffer)
+        : JSON.stringify(options.body);
+  return (await graph.makeRequest(endpoint, {
+    accessToken: token,
+    method: options.method ?? 'GET',
+    ...(body !== undefined ? { body } : {}),
+    ...(options.headers ? { headers: options.headers } : {}),
+  })) as T;
+}
+
+/** Read Graph byte content into memory, refusing past FILE_OPS_MAX_BYTES. */
+async function graphBytes(graph: GraphClient, token: string, endpoint: string): Promise<Buffer> {
+  const res = await graph.downloadStream(endpoint, { accessToken: token });
+  if (res.contentLength !== null && res.contentLength > FILE_OPS_MAX_BYTES) {
+    await res.body.cancel().catch(() => undefined);
+    throw new FileOpsError(tooLarge(res.contentLength));
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > FILE_OPS_MAX_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw new FileOpsError(tooLarge(total));
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
+function tooLarge(size: number): string {
+  return `File is ${size} bytes, over the 150 MB (${FILE_OPS_MAX_BYTES} bytes) limit for these tools. Move it in the browser instead.`;
+}
+
+/** PUT the buffer to a pre-authenticated upload session URL in ranges. Returns the last response. */
+async function uploadInRanges(
+  uploadUrl: string,
+  bytes: Buffer
+): Promise<{ status: number; headers: Headers; text: string }> {
+  const config = loadResilienceConfig();
+  const breaker = getSharedBreaker();
+  let last: { status: number; headers: Headers; text: string } | undefined;
+  for (let start = 0; start < bytes.length; start += UPLOAD_CHUNK_BYTES) {
+    const end = Math.min(start + UPLOAD_CHUNK_BYTES, bytes.length);
+    const chunk = bytes.subarray(start, end);
+    // The session URL carries its own authorization; Graph rejects a bearer header here.
+    const response = await fetchWithResilience(
+      uploadUrl,
+      {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(chunk.length),
+          'Content-Range': `bytes ${start}-${end - 1}/${bytes.length}`,
+        },
+        body: chunk as unknown as string,
+      },
+      config,
+      breaker
+    );
+    const text = await response.text();
+    if (!response.ok) {
+      await fetch(uploadUrl, { method: 'DELETE' }).catch(() => undefined);
+      throw new FileOpsError(
+        `Upload session rejected bytes ${start}-${end - 1} of ${bytes.length}: ${response.status} ${text.slice(0, 500)}`
+      );
+    }
+    last = { status: response.status, headers: response.headers, text };
+  }
+  if (!last) throw new FileOpsError('Nothing to upload: the file is empty.');
+  return last;
+}
+
+// ---------------------------------------------------------------------------
+// Sources
+
+interface SourceFile {
+  bytes: Buffer;
+  name: string;
+  contentType: string;
+  label: string;
+}
+
+interface AttachmentMeta {
+  '@odata.type'?: string;
+  id?: string;
+  name?: string;
+  contentType?: string;
+  size?: number;
+}
+
+async function readMailAttachment(
+  graph: GraphClient,
+  token: string,
+  messageId: string,
+  attachmentId: string
+): Promise<SourceFile> {
+  const base = `/me/messages/${enc(messageId)}/attachments/${enc(attachmentId)}`;
+  const label = `message:${messageId}/attachment:${attachmentId}`;
+  let meta: AttachmentMeta;
+  try {
+    // $select keeps contentBytes out of the metadata read.
+    meta = await graphJson<AttachmentMeta>(
+      graph,
+      token,
+      `${base}?$select=id,name,contentType,size`
+    );
+  } catch (error) {
+    throw new FileOpsError(describe(error, `Attachment ${attachmentId} on message ${messageId}`));
+  }
+  const kind = (meta['@odata.type'] ?? '').toLowerCase();
+  if (kind.endsWith('referenceattachment')) {
+    throw new FileOpsError(
+      `Attachment "${meta.name ?? attachmentId}" is a cloud link (reference attachment), not a file. Open the linked file instead.`
+    );
+  }
+  if (typeof meta.size === 'number' && meta.size > FILE_OPS_MAX_BYTES) {
+    throw new FileOpsError(tooLarge(meta.size));
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await graphBytes(graph, token, `${base}/$value`);
+  } catch (error) {
+    throw new FileOpsError(describe(error, `Attachment ${attachmentId} content`));
+  }
+  let name = meta.name || 'attachment';
+  if (kind.endsWith('itemattachment') && !/\.[a-z0-9]{2,5}$/i.test(name)) name = `${name}.eml`;
+  return {
+    bytes,
+    name,
+    contentType: meta.contentType || 'application/octet-stream',
+    label,
+  };
+}
+
+interface DriveItemMeta {
+  id?: string;
+  name?: string;
+  size?: number;
+  webUrl?: string;
+  file?: { mimeType?: string };
+  folder?: unknown;
+}
+
+async function readDriveFile(
+  graph: GraphClient,
+  token: string,
+  driveId: string,
+  itemId: string
+): Promise<SourceFile> {
+  const base = `/drives/${enc(driveId)}/items/${enc(itemId)}`;
+  let meta: DriveItemMeta;
+  try {
+    meta = await graphJson<DriveItemMeta>(
+      graph,
+      token,
+      `${base}?$select=id,name,size,webUrl,file,folder`
+    );
+  } catch (error) {
+    throw new FileOpsError(describe(error, `Drive item ${itemId} in drive ${driveId}`));
+  }
+  if (meta.folder !== undefined || meta.file === undefined) {
+    throw new FileOpsError(`Drive item "${meta.name ?? itemId}" is a folder, not a file.`);
+  }
+  if (typeof meta.size === 'number' && meta.size > FILE_OPS_MAX_BYTES) {
+    throw new FileOpsError(tooLarge(meta.size));
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await graphBytes(graph, token, `${base}/content`);
+  } catch (error) {
+    throw new FileOpsError(describe(error, `Drive item ${itemId} content`));
+  }
+  return {
+    bytes,
+    name: meta.name || 'file',
+    contentType: meta.file?.mimeType || 'application/octet-stream',
+    label: `drive:${driveId}/item:${itemId}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Destinations
+
+interface DraftMeta {
+  id?: string;
+  isDraft?: boolean;
+  subject?: string;
+  webLink?: string;
+}
+
+async function requireDraft(
+  graph: GraphClient,
+  token: string,
+  draftId: string
+): Promise<DraftMeta> {
+  let draft: DraftMeta;
+  try {
+    draft = await graphJson<DraftMeta>(
+      graph,
+      token,
+      `/me/messages/${enc(draftId)}?$select=id,isDraft,subject,webLink`
+    );
+  } catch (error) {
+    throw new FileOpsError(describe(error, `Draft message ${draftId}`));
+  }
+  if (draft.isDraft !== true) {
+    throw new FileOpsError(
+      `Message ${draftId} ("${draft.subject ?? ''}") is not a draft. Attachments are added to drafts only.`
+    );
+  }
+  return draft;
+}
+
+function attachmentIdFromLocation(location: string | null): string | undefined {
+  if (!location) return undefined;
+  const m = location.match(/Attachments\('([^']+)'\)/i);
+  return m ? decodeURIComponent(m[1]) : undefined;
+}
+
+async function attachToDraft(
+  graph: GraphClient,
+  token: string,
+  draftId: string,
+  file: SourceFile,
+  attachmentName: string | undefined
+): Promise<{ attachmentId: string; name: string; size: number; method: string }> {
+  const name = (attachmentName && attachmentName.trim()) || file.name;
+  const size = file.bytes.length;
+  const base = `/me/messages/${enc(draftId)}/attachments`;
+  if (size < MAIL_INLINE_ATTACHMENT_MAX_BYTES) {
+    const created = await graphJson<{ id?: string; name?: string; size?: number }>(
+      graph,
+      token,
+      base,
+      {
+        method: 'POST',
+        body: {
+          '@odata.type': '#microsoft.graph.fileAttachment',
+          name,
+          contentType: file.contentType,
+          contentBytes: file.bytes.toString('base64'),
+        },
+      }
+    );
+    if (!created?.id) throw new FileOpsError('Graph did not return an attachment id.');
+    return { attachmentId: created.id, name: created.name ?? name, size, method: 'inline' };
+  }
+  const session = await graphJson<{ uploadUrl?: string }>(
+    graph,
+    token,
+    `${base}/createUploadSession`,
+    {
+      method: 'POST',
+      body: {
+        AttachmentItem: { attachmentType: 'file', name, size, contentType: file.contentType },
+      },
+    }
+  );
+  if (!session?.uploadUrl) throw new FileOpsError('Graph did not return an upload session URL.');
+  const last = await uploadInRanges(session.uploadUrl, file.bytes);
+  let attachmentId = attachmentIdFromLocation(last.headers.get('location'));
+  if (!attachmentId) {
+    // Fall back to reading the draft's attachment list (metadata only).
+    const list = await graphJson<{ value?: Array<{ id?: string; name?: string; size?: number }> }>(
+      graph,
+      token,
+      `${base}?$select=id,name,size`
+    );
+    const match = (list.value ?? []).filter((a) => a.name === name).pop();
+    attachmentId = match?.id;
+  }
+  if (!attachmentId) {
+    throw new FileOpsError(
+      `Upload finished but the new attachment id could not be read. Check the draft's attachment list for "${name}".`
+    );
+  }
+  return { attachmentId, name, size, method: 'uploadSession' };
+}
+
+interface DriveWriteResult {
+  id?: string;
+  name?: string;
+  size?: number;
+  webUrl?: string;
+}
+
+async function writeToDrive(
+  graph: GraphClient,
+  token: string,
+  driveId: string,
+  folder: { itemId?: string; path?: string },
+  fileName: string,
+  bytes: Buffer,
+  conflictBehavior: ConflictBehavior
+): Promise<DriveWriteResult> {
+  const parent = folder.itemId
+    ? `/drives/${enc(driveId)}/items/${enc(folder.itemId)}:/${enc(fileName)}:`
+    : `/drives/${enc(driveId)}/root:/${encodePath(folder.path ?? '')}/${enc(fileName)}:`;
+  if (bytes.length < DRIVE_SIMPLE_UPLOAD_MAX_BYTES) {
+    return await graphJson<DriveWriteResult>(
+      graph,
+      token,
+      `${parent}/content?@microsoft.graph.conflictBehavior=${conflictBehavior}`,
+      {
+        method: 'PUT',
+        body: bytes,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      }
+    );
+  }
+  const session = await graphJson<{ uploadUrl?: string }>(
+    graph,
+    token,
+    `${parent}/createUploadSession`,
+    {
+      method: 'POST',
+      body: { item: { '@microsoft.graph.conflictBehavior': conflictBehavior, name: fileName } },
+    }
+  );
+  if (!session?.uploadUrl) throw new FileOpsError('Graph did not return an upload session URL.');
+  const last = await uploadInRanges(session.uploadUrl, bytes);
+  try {
+    return JSON.parse(last.text) as DriveWriteResult;
+  } catch {
+    throw new FileOpsError('Upload finished but Graph did not return the new drive item.');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Matter folder search
+
+interface FolderChild {
+  id?: string;
+  name?: string;
+  webUrl?: string;
+  folder?: unknown;
+}
+
+const rootCache = new Map<string, { id: string; webUrl?: string }>();
+
+/** Test hook: forget the resolved Matters root. */
+export function __resetMattersRootCacheForTests(): void {
+  rootCache.clear();
+}
+
+export function mattersRoot(): { driveId: string; rootPath: string } {
+  const driveId = process.env.MATTERS_DRIVE_ID?.trim() || DEFAULT_MATTERS_DRIVE_ID;
+  const rootPath = (process.env.MATTERS_ROOT_PATH?.trim() || DEFAULT_MATTERS_ROOT_PATH).replace(
+    /^\/+|\/+$/g,
+    ''
+  );
+  return { driveId, rootPath };
+}
+
+async function listChildFolders(
+  graph: GraphClient,
+  token: string,
+  driveId: string,
+  itemId: string
+): Promise<FolderChild[]> {
+  const out: FolderChild[] = [];
+  let endpoint: string | undefined =
+    `/drives/${enc(driveId)}/items/${enc(itemId)}/children?$select=id,name,webUrl,folder&$top=999`;
+  const graphBase = `${getGraphBaseUrl()}/v1.0`;
+  while (endpoint) {
+    const page: { value?: FolderChild[]; '@odata.nextLink'?: string } = await graphJson(
+      graph,
+      token,
+      endpoint
+    );
+    for (const child of page.value ?? []) if (child.folder !== undefined) out.push(child);
+    const next = page['@odata.nextLink'];
+    endpoint = next
+      ? next.startsWith(graphBase)
+        ? next.slice(graphBase.length)
+        : next.replace(/^https:\/\/[^/]+\/v1\.0/, '')
+      : undefined;
+  }
+  return out;
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export interface MatterMatch {
+  client: string;
+  matter: string | null;
+  itemId: string;
+  driveId: string;
+  path: string;
+  webUrl: string | null;
+  exact: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Tool definitions
+
+function withAccount(
+  ctx: UtilityToolContext,
+  schema: Record<string, z.ZodTypeAny>
+): Record<string, z.ZodTypeAny> {
+  if (ctx.multiAccount) {
+    schema['account'] = z
+      .string()
+      .optional()
+      .describe(
+        'Account to use when multiple Microsoft accounts are configured. Required when multiple accounts exist (see list-accounts).'
+      );
+  }
+  return schema;
+}
+
+function str(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+export const FILE_OPS_TOOLS: UtilityTool[] = [
+  {
+    name: 'save_attachment_to_drive',
+    method: 'PUT',
+    path: 'tool:save_attachment_to_drive',
+    searchKeywords:
+      'save attachment to onedrive sharepoint matter folder file email attachment upload copy attachment to drive',
+    description:
+      'Save a mail attachment into a OneDrive or SharePoint folder, server side (the bytes never pass through the conversation). Give the folder as folderItemId or as folderPath relative to the drive root. conflictBehavior defaults to "rename" (keeps both); "fail" refuses if the name exists; "replace" overwrites and is used only when passed explicitly. fileName defaults to the attachment name with SharePoint-illegal characters removed. Returns { itemId, name, size, webUrl }. Limit 150 MB.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    buildSchema: (ctx) =>
+      withAccount(ctx, {
+        messageId: z.string().describe('Id of the message that carries the attachment.'),
+        attachmentId: z.string().describe('Attachment id (list-mail-attachments returns it).'),
+        driveId: z.string().describe('Destination drive id.'),
+        folderItemId: z
+          .string()
+          .optional()
+          .describe('Destination folder item id. Give this or folderPath, not both.'),
+        folderPath: z
+          .string()
+          .optional()
+          .describe(
+            'Destination folder path relative to the drive root, e.g. "GC Associates/Matters/Client/Matter". Give this or folderItemId, not both.'
+          ),
+        fileName: z
+          .string()
+          .optional()
+          .describe('File name to save as. Defaults to the attachment name, made SharePoint-safe.'),
+        conflictBehavior: z
+          .enum(CONFLICT_BEHAVIORS)
+          .optional()
+          .describe(
+            'What to do when a file with that name already exists: rename (default), fail, or replace (overwrite; only when explicitly intended).'
+          ),
+      }),
+    execute: async (params, ctx) => {
+      const tool = 'save_attachment_to_drive';
+      const messageId = str(params.messageId);
+      const attachmentId = str(params.attachmentId);
+      const driveId = str(params.driveId);
+      const folderItemId = str(params.folderItemId);
+      const folderPath = str(params.folderPath);
+      if (!messageId || !attachmentId || !driveId) {
+        return fail('messageId, attachmentId, and driveId are required.');
+      }
+      if (!folderItemId && !folderPath) return fail('Give folderItemId or folderPath.');
+      if (folderItemId && folderPath) {
+        return fail('Give folderItemId or folderPath, not both.');
+      }
+      const conflictRaw = params.conflictBehavior ?? 'rename';
+      if (!CONFLICT_BEHAVIORS.includes(conflictRaw as ConflictBehavior)) {
+        return fail('conflictBehavior must be "rename", "fail", or "replace".');
+      }
+      const conflictBehavior = conflictRaw as ConflictBehavior;
+      const destination = folderItemId
+        ? `drive:${driveId}/item:${folderItemId}`
+        : `drive:${driveId}/path:${folderPath}`;
+      try {
+        const token = await resolveToken(ctx, params.account as string | undefined);
+        const file = await readMailAttachment(ctx.graphClient, token, messageId, attachmentId);
+        const fileName = sharePointSafeName(str(params.fileName) ?? file.name);
+        if (!fileName) return fail('The file name is empty after removing illegal characters.');
+        let written: DriveWriteResult;
+        try {
+          written = await writeToDrive(
+            ctx.graphClient,
+            token,
+            driveId,
+            { itemId: folderItemId, path: folderPath },
+            fileName,
+            file.bytes,
+            conflictBehavior
+          );
+        } catch (error) {
+          if (statusOf(error) === 409) {
+            throw new FileOpsError(
+              `A file named "${fileName}" already exists in that folder and conflictBehavior is "${conflictBehavior}". Nothing was written.`
+            );
+          }
+          throw new FileOpsError(
+            describe(error, `Destination folder ${folderItemId ?? folderPath}`)
+          );
+        }
+        logOp(tool, file.label, `${destination}/${written.name ?? fileName}`, file.bytes.length);
+        return ok({
+          itemId: written.id,
+          name: written.name ?? fileName,
+          size: written.size ?? file.bytes.length,
+          webUrl: written.webUrl,
+          conflictBehavior,
+        });
+      } catch (error) {
+        logOp(
+          tool,
+          `message:${messageId}/attachment:${attachmentId}`,
+          `${destination} FAILED`,
+          null
+        );
+        return fail(describe(error, 'The item'));
+      }
+    },
+  },
+  {
+    name: 'attach_drive_file_to_draft',
+    method: 'POST',
+    path: 'tool:attach_drive_file_to_draft',
+    searchKeywords:
+      'attach onedrive file to draft attach sharepoint document to email draft add attachment from drive',
+    description:
+      'Attach a OneDrive or SharePoint file to a draft email, server side (the bytes never pass through the conversation). Files under 3 MB are attached directly; 3 MB to 150 MB go through an attachment upload session. The target must be a draft. Returns { attachmentId, name, size }.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    buildSchema: (ctx) =>
+      withAccount(ctx, {
+        draftMessageId: z.string().describe('Id of the draft message to attach to.'),
+        driveId: z.string().describe('Drive id of the file.'),
+        itemId: z.string().describe('Drive item id of the file.'),
+        attachmentName: z
+          .string()
+          .optional()
+          .describe('Name the attachment shows on the draft. Defaults to the file name.'),
+      }),
+    execute: async (params, ctx) => {
+      const tool = 'attach_drive_file_to_draft';
+      const draftId = str(params.draftMessageId);
+      const driveId = str(params.driveId);
+      const itemId = str(params.itemId);
+      if (!draftId || !driveId || !itemId) {
+        return fail('draftMessageId, driveId, and itemId are required.');
+      }
+      try {
+        const token = await resolveToken(ctx, params.account as string | undefined);
+        const draft = await requireDraft(ctx.graphClient, token, draftId);
+        const file = await readDriveFile(ctx.graphClient, token, driveId, itemId);
+        const result = await attachToDraft(
+          ctx.graphClient,
+          token,
+          draftId,
+          file,
+          str(params.attachmentName)
+        ).catch((error) => {
+          throw new FileOpsError(describe(error, `Draft message ${draftId}`));
+        });
+        logOp(tool, file.label, `draft:${draftId}/attachment:${result.attachmentId}`, result.size);
+        return ok({
+          attachmentId: result.attachmentId,
+          name: result.name,
+          size: result.size,
+          uploadMethod: result.method,
+          draftWebLink: draft.webLink,
+        });
+      } catch (error) {
+        logOp(tool, `drive:${driveId}/item:${itemId}`, `draft:${draftId} FAILED`, null);
+        return fail(describe(error, 'The item'));
+      }
+    },
+  },
+  {
+    name: 'attach_mail_attachment_to_draft',
+    method: 'POST',
+    path: 'tool:attach_mail_attachment_to_draft',
+    searchKeywords:
+      'copy attachment from one email to a draft forward attachment to draft attach received attachment',
+    description:
+      'Copy an attachment from one message onto a draft email, server side (the bytes never pass through the conversation). Under 3 MB it is attached directly; 3 MB to 150 MB through an attachment upload session. The target must be a draft. Returns { attachmentId, name, size }.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    buildSchema: (ctx) =>
+      withAccount(ctx, {
+        sourceMessageId: z.string().describe('Id of the message that carries the attachment.'),
+        attachmentId: z.string().describe('Attachment id on the source message.'),
+        draftMessageId: z.string().describe('Id of the draft message to attach to.'),
+        attachmentName: z
+          .string()
+          .optional()
+          .describe('Name the attachment shows on the draft. Defaults to the source name.'),
+      }),
+    execute: async (params, ctx) => {
+      const tool = 'attach_mail_attachment_to_draft';
+      const sourceId = str(params.sourceMessageId);
+      const attachmentId = str(params.attachmentId);
+      const draftId = str(params.draftMessageId);
+      if (!sourceId || !attachmentId || !draftId) {
+        return fail('sourceMessageId, attachmentId, and draftMessageId are required.');
+      }
+      try {
+        const token = await resolveToken(ctx, params.account as string | undefined);
+        const draft = await requireDraft(ctx.graphClient, token, draftId);
+        const file = await readMailAttachment(ctx.graphClient, token, sourceId, attachmentId);
+        const result = await attachToDraft(
+          ctx.graphClient,
+          token,
+          draftId,
+          file,
+          str(params.attachmentName)
+        ).catch((error) => {
+          throw new FileOpsError(describe(error, `Draft message ${draftId}`));
+        });
+        logOp(tool, file.label, `draft:${draftId}/attachment:${result.attachmentId}`, result.size);
+        return ok({
+          attachmentId: result.attachmentId,
+          name: result.name,
+          size: result.size,
+          uploadMethod: result.method,
+          draftWebLink: draft.webLink,
+        });
+      } catch (error) {
+        logOp(
+          tool,
+          `message:${sourceId}/attachment:${attachmentId}`,
+          `draft:${draftId} FAILED`,
+          null
+        );
+        return fail(describe(error, 'The item'));
+      }
+    },
+  },
+  {
+    name: 'find_matter_folder',
+    method: 'GET',
+    path: 'tool:find_matter_folder',
+    searchKeywords: 'find matter folder client folder sharepoint matters locate case folder',
+    description:
+      'Find a client or matter folder under the firm Matters root (client folders, then matter or sub-client folders, two levels deep) by case-insensitive substring match on folder names. Returns [{ client, matter, itemId, driveId, path, webUrl, exact }], exact matches first. matter is null for a client-level folder.',
+    readOnlyHint: true,
+    openWorldHint: true,
+    buildSchema: (ctx) =>
+      withAccount(ctx, {
+        query: z.string().describe('Part of a client or matter folder name.'),
+        maxResults: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe('Most results to return (default 10, max 50).'),
+      }),
+    execute: async (params, ctx) => {
+      const tool = 'find_matter_folder';
+      const query = str(params.query)?.toLowerCase();
+      if (!query) return fail('query is required.');
+      const maxRaw = params.maxResults ?? 10;
+      if (typeof maxRaw !== 'number' || !Number.isInteger(maxRaw) || maxRaw < 1 || maxRaw > 50) {
+        return fail('maxResults must be an integer from 1 to 50.');
+      }
+      const { driveId, rootPath } = mattersRoot();
+      try {
+        const token = await resolveToken(ctx, params.account as string | undefined);
+        const cacheKey = `${driveId}|${rootPath}`;
+        let root = rootCache.get(cacheKey);
+        if (!root) {
+          let item: FolderChild;
+          try {
+            item = await graphJson<FolderChild>(
+              ctx.graphClient,
+              token,
+              `/drives/${enc(driveId)}/root:/${encodePath(rootPath)}?$select=id,name,webUrl,folder`
+            );
+          } catch (error) {
+            throw new FileOpsError(
+              describe(error, `Matters root "${rootPath}" in drive ${driveId}`)
+            );
+          }
+          if (!item.id) throw new FileOpsError(`Matters root "${rootPath}" returned no id.`);
+          root = { id: item.id, webUrl: item.webUrl };
+          rootCache.set(cacheKey, root);
+        }
+        const clients = await listChildFolders(ctx.graphClient, token, driveId, root.id);
+        const matters = await mapLimit(clients, 8, (c) =>
+          listChildFolders(ctx.graphClient, token, driveId, c.id as string)
+        );
+        const matches: MatterMatch[] = [];
+        clients.forEach((client, i) => {
+          const clientName = client.name ?? '';
+          if (clientName.toLowerCase().includes(query)) {
+            matches.push({
+              client: clientName,
+              matter: null,
+              itemId: client.id as string,
+              driveId,
+              path: `${rootPath}/${clientName}`,
+              webUrl: client.webUrl ?? null,
+              exact: clientName.toLowerCase() === query,
+            });
+          }
+          for (const m of matters[i]) {
+            const matterName = m.name ?? '';
+            if (!matterName.toLowerCase().includes(query)) continue;
+            matches.push({
+              client: clientName,
+              matter: matterName,
+              itemId: m.id as string,
+              driveId,
+              path: `${rootPath}/${clientName}/${matterName}`,
+              webUrl: m.webUrl ?? null,
+              exact: matterName.toLowerCase() === query,
+            });
+          }
+        });
+        matches.sort((a, b) =>
+          a.exact !== b.exact ? (a.exact ? -1 : 1) : a.path.localeCompare(b.path)
+        );
+        const results = matches.slice(0, maxRaw);
+        logOp(tool, `drive:${driveId}/path:${rootPath}`, `query:${query}`, matches.length);
+        return ok(results);
+      } catch (error) {
+        logOp(tool, `drive:${driveId}/path:${rootPath}`, `query:${query} FAILED`, null);
+        return fail(describe(error, 'The Matters folder'));
+      }
+    },
+  },
+];

@@ -16,6 +16,7 @@ import AuthManager, {
 import { api as betaApi } from './generated/client-beta.js';
 import { api } from './generated/client.js';
 import GraphClient, { getBlobMaxBytes, isBlobOutputEnabled } from './graph-client.js';
+import { FILE_OPS_TOOLS } from './file-ops.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
 import { MAX_UPLOAD_BYTES, uploadAttachment } from './lib/attachment-upload.js';
 import { getUploadDirs, openUploadFile, type UploadFile } from './lib/upload-dirs.js';
@@ -955,7 +956,7 @@ async function executeUtilityTool(
   }
 }
 
-interface UtilityToolContext {
+export interface UtilityToolContext {
   graphClient: GraphClient;
   authManager?: AuthManager;
   multiAccount: boolean;
@@ -963,7 +964,7 @@ interface UtilityToolContext {
   userFields?: string[];
 }
 
-interface UtilityTool {
+export interface UtilityTool {
   name: string;
   // Synthetic for display in search-tools / get-tool-schema. The `tool:` prefix
   // marks these as non-Graph so an LLM doesn't try to construct a Graph URL from them.
@@ -2385,6 +2386,8 @@ export const UTILITY_TOOLS: readonly UtilityTool[] = [
       }
     },
   },
+  // Firm Graph-to-Graph file tools (src/file-ops.ts).
+  ...FILE_OPS_TOOLS,
 ];
 
 function registerUtilityToolWithMcp(

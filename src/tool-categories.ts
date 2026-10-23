@@ -103,6 +103,12 @@ const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
   'upload-attachment-from-file': ['mail', 'calendar', 'outlook', 'personal', 'work'],
   'parse-teams-url': ['teams', 'teams-write', 'work'],
   'read-mail-text': ['mail', 'outlook', 'personal', 'work'],
+  // Firm Graph-to-Graph file tools (src/file-ops.ts): they span mail and drive, so they ride
+  // with both families of presets.
+  save_attachment_to_drive: ['mail', 'outlook', 'files', 'onedrive', 'personal', 'work'],
+  attach_drive_file_to_draft: ['mail', 'outlook', 'files', 'onedrive', 'personal', 'work'],
+  attach_mail_attachment_to_draft: ['mail', 'outlook', 'personal', 'work'],
+  find_matter_folder: ['files', 'onedrive', 'personal', 'work'],
 };
 
 // Fail fast if a scoped utility references a preset that does not exist (e.g. a typo like
