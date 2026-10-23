@@ -160,19 +160,19 @@ function noBase64(result: { content: Array<{ text?: string }> }, buf: Buffer): v
 describe('registration', () => {
   it('registers the four file tools and puts them in the presets', () => {
     for (const name of [
-      'save_attachment_to_drive',
-      'attach_drive_file_to_draft',
-      'attach_mail_attachment_to_draft',
-      'find_matter_folder',
+      'save-attachment-to-drive',
+      'attach-drive-file-to-draft',
+      'attach-mail-attachment-to-draft',
+      'find-matter-folder',
     ]) {
       expect(UTILITY_TOOLS.some((u) => u.name === name)).toBe(true);
     }
-    expect(TOOL_CATEGORIES.mail.pattern.test('save_attachment_to_drive')).toBe(true);
-    expect(TOOL_CATEGORIES.mail.pattern.test('attach_mail_attachment_to_draft')).toBe(true);
-    expect(TOOL_CATEGORIES.files.pattern.test('attach_drive_file_to_draft')).toBe(true);
-    expect(TOOL_CATEGORIES.files.pattern.test('find_matter_folder')).toBe(true);
-    expect(tool('find_matter_folder').readOnlyHint).toBe(true);
-    expect(tool('save_attachment_to_drive').readOnlyHint).toBe(false);
+    expect(TOOL_CATEGORIES.mail.pattern.test('save-attachment-to-drive')).toBe(true);
+    expect(TOOL_CATEGORIES.mail.pattern.test('attach-mail-attachment-to-draft')).toBe(true);
+    expect(TOOL_CATEGORIES.files.pattern.test('attach-drive-file-to-draft')).toBe(true);
+    expect(TOOL_CATEGORIES.files.pattern.test('find-matter-folder')).toBe(true);
+    expect(tool('find-matter-folder').readOnlyHint).toBe(true);
+    expect(tool('save-attachment-to-drive').readOnlyHint).toBe(false);
   });
 });
 
@@ -186,8 +186,8 @@ describe('sharePointSafeName', () => {
   });
 });
 
-describe('save_attachment_to_drive', () => {
-  const t = () => tool('save_attachment_to_drive');
+describe('save-attachment-to-drive', () => {
+  const t = () => tool('save-attachment-to-drive');
 
   it('small file: single PUT with conflictBehavior=rename by default and a safe name', async () => {
     const buf = bytes(1000);
@@ -217,7 +217,7 @@ describe('save_attachment_to_drive', () => {
     noBase64(r, buf);
     const log = logLines.find((l) => l.startsWith('[file-ops]'))!;
     const entry = JSON.parse(log.slice('[file-ops] '.length));
-    expect(entry).toMatchObject({ tool: 'save_attachment_to_drive', size: 1000 });
+    expect(entry).toMatchObject({ tool: 'save-attachment-to-drive', size: 1000 });
     expect(entry.source).toContain('MSG1');
     expect(entry.destination).toContain('F1');
     expect(typeof entry.ts).toBe('string');
@@ -285,7 +285,7 @@ describe('save_attachment_to_drive', () => {
   it('conflictBehavior fail: a 409 is reported as a name clash and nothing else is tried', async () => {
     mockAttachment(bytes(10), 'a.pdf');
     on('PUT', /conflictBehavior=fail/, () => graphError(409, 'nameAlreadyExists'));
-    const r = await tool('save_attachment_to_drive').execute(
+    const r = await tool('save-attachment-to-drive').execute(
       {
         messageId: 'MSG1',
         attachmentId: 'ATT1',
@@ -303,7 +303,7 @@ describe('save_attachment_to_drive', () => {
   it('replace is sent only when passed explicitly; unknown values are refused', async () => {
     mockAttachment(bytes(10), 'a.pdf');
     on('PUT', /\/content\?/, () => json({ id: 'N', name: 'a.pdf', size: 10, webUrl: 'w' }));
-    await tool('save_attachment_to_drive').execute(
+    await tool('save-attachment-to-drive').execute(
       {
         messageId: 'MSG1',
         attachmentId: 'ATT1',
@@ -315,7 +315,7 @@ describe('save_attachment_to_drive', () => {
     );
     expect(calls.find((c) => c.method === 'PUT')!.url).toMatch(/conflictBehavior=replace$/);
     calls = [];
-    const bad = await tool('save_attachment_to_drive').execute(
+    const bad = await tool('save-attachment-to-drive').execute(
       {
         messageId: 'MSG1',
         attachmentId: 'ATT1',
@@ -330,13 +330,13 @@ describe('save_attachment_to_drive', () => {
   });
 
   it('refuses a missing folder argument, a missing token, and a missing attachment', async () => {
-    const noFolder = await tool('save_attachment_to_drive').execute(
+    const noFolder = await tool('save-attachment-to-drive').execute(
       { messageId: 'MSG1', attachmentId: 'ATT1', driveId: 'D1' },
       makeCtx()
     );
     expect(parse(noFolder).error).toMatch(/folderItemId or folderPath/);
 
-    const noToken = await tool('save_attachment_to_drive').execute(
+    const noToken = await tool('save-attachment-to-drive').execute(
       { messageId: 'MSG1', attachmentId: 'ATT1', driveId: 'D1', folderItemId: 'F1' },
       makeCtx(null)
     );
@@ -345,7 +345,7 @@ describe('save_attachment_to_drive', () => {
     expect(calls).toHaveLength(0);
 
     on('GET', ATT_META, () => graphError(404, 'ErrorItemNotFound'));
-    const missing = await tool('save_attachment_to_drive').execute(
+    const missing = await tool('save-attachment-to-drive').execute(
       { messageId: 'MSG1', attachmentId: 'ATT1', driveId: 'D1', folderItemId: 'F1' },
       makeCtx()
     );
@@ -354,7 +354,7 @@ describe('save_attachment_to_drive', () => {
 
   it('refuses an attachment over 150 MB before downloading it', async () => {
     mockAttachment(bytes(10), 'huge.pdf', FILE_OPS_MAX_BYTES + 1);
-    const r = await tool('save_attachment_to_drive').execute(
+    const r = await tool('save-attachment-to-drive').execute(
       { messageId: 'MSG1', attachmentId: 'ATT1', driveId: 'D1', folderItemId: 'F1' },
       makeCtx()
     );
@@ -400,8 +400,8 @@ function mockAttachmentUploadSession(size: number, received: Buffer[]) {
   });
 }
 
-describe('attach_drive_file_to_draft', () => {
-  const t = () => tool('attach_drive_file_to_draft');
+describe('attach-drive-file-to-draft', () => {
+  const t = () => tool('attach-drive-file-to-draft');
 
   it('small file: one POST fileAttachment built server side, no bytes returned', async () => {
     const buf = bytes(2000);
@@ -509,8 +509,8 @@ describe('attach_drive_file_to_draft', () => {
   });
 });
 
-describe('attach_mail_attachment_to_draft', () => {
-  const t = () => tool('attach_mail_attachment_to_draft');
+describe('attach-mail-attachment-to-draft', () => {
+  const t = () => tool('attach-mail-attachment-to-draft');
 
   it('small attachment: inline POST', async () => {
     const buf = bytes(500);
@@ -532,7 +532,7 @@ describe('attach_mail_attachment_to_draft', () => {
       uploadMethod: 'inline',
     });
     noBase64(r, buf);
-    expect(logLines.some((l) => l.includes('"tool":"attach_mail_attachment_to_draft"'))).toBe(true);
+    expect(logLines.some((l) => l.includes('"tool":"attach-mail-attachment-to-draft"'))).toBe(true);
   });
 
   it('large attachment: upload session', async () => {
@@ -583,8 +583,8 @@ describe('attach_mail_attachment_to_draft', () => {
   });
 });
 
-describe('find_matter_folder', () => {
-  const t = () => tool('find_matter_folder');
+describe('find-matter-folder', () => {
+  const t = () => tool('find-matter-folder');
 
   function mockTree(driveId = DEFAULT_MATTERS_DRIVE_ID, rootPath = 'GC%20Associates/Matters') {
     const d = encodeURIComponent(driveId);
@@ -646,7 +646,7 @@ describe('find_matter_folder', () => {
         exact: false,
       },
     ]);
-    expect(logLines.some((l) => l.includes('"tool":"find_matter_folder"'))).toBe(true);
+    expect(logLines.some((l) => l.includes('"tool":"find-matter-folder"'))).toBe(true);
   });
 
   it('finds a matter by part of its name, honors maxResults, and resolves the root once', async () => {

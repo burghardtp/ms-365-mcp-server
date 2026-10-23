@@ -86,7 +86,7 @@ describe('Read-Only Mode', () => {
     registerGraphTools(mockServer, {} as GraphClient, { readOnly: options.readOnly });
 
     // 1 GET graph endpoint via registerTool; parse-teams-url + download-bytes +
-    // download-bytes-to-file + get-download-url + read-mail-text + find_matter_folder
+    // download-bytes-to-file + get-download-url + read-mail-text + find-matter-folder
     // utilities via tool
     expect(mockServer.registerTool).toHaveBeenCalledTimes(1);
     expect(mockServer.tool).toHaveBeenCalledTimes(6);
@@ -146,7 +146,7 @@ describe('Read-Only Mode', () => {
 
     // 2 graph tools (list-mail-messages + get-schedule) + utilities
     // (parse-teams-url, download-bytes, download-bytes-to-file, get-download-url,
-    // read-mail-text, find_matter_folder)
+    // read-mail-text, find-matter-folder)
     expect(mockServer.registerTool).toHaveBeenCalledTimes(2);
     expect(mockServer.tool).toHaveBeenCalledTimes(6);
   });

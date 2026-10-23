@@ -5,10 +5,10 @@
  * and links of what it wrote.
  *
  * Tools:
- *   save_attachment_to_drive         mail attachment -> drive folder
- *   attach_drive_file_to_draft       drive file -> draft message attachment
- *   attach_mail_attachment_to_draft  mail attachment -> draft message attachment
- *   find_matter_folder               search the Matters tree two levels deep
+ *   save-attachment-to-drive         mail attachment -> drive folder
+ *   attach-drive-file-to-draft       drive file -> draft message attachment
+ *   attach-mail-attachment-to-draft  mail attachment -> draft message attachment
+ *   find-matter-folder               search the Matters tree two levels deep
  *
  * Every call writes one log line: { ts, tool, source, destination, size }.
  */
@@ -598,9 +598,9 @@ function str(value: unknown): string | undefined {
 
 export const FILE_OPS_TOOLS: UtilityTool[] = [
   {
-    name: 'save_attachment_to_drive',
+    name: 'save-attachment-to-drive',
     method: 'PUT',
-    path: 'tool:save_attachment_to_drive',
+    path: 'tool:save-attachment-to-drive',
     searchKeywords:
       'save attachment to onedrive sharepoint matter folder file email attachment upload copy attachment to drive',
     description:
@@ -634,7 +634,7 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
           ),
       }),
     execute: async (params, ctx) => {
-      const tool = 'save_attachment_to_drive';
+      const tool = 'save-attachment-to-drive';
       const messageId = str(params.messageId);
       const attachmentId = str(params.attachmentId);
       const driveId = str(params.driveId);
@@ -701,9 +701,9 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
     },
   },
   {
-    name: 'attach_drive_file_to_draft',
+    name: 'attach-drive-file-to-draft',
     method: 'POST',
-    path: 'tool:attach_drive_file_to_draft',
+    path: 'tool:attach-drive-file-to-draft',
     searchKeywords:
       'attach onedrive file to draft attach sharepoint document to email draft add attachment from drive',
     description:
@@ -721,7 +721,7 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
           .describe('Name the attachment shows on the draft. Defaults to the file name.'),
       }),
     execute: async (params, ctx) => {
-      const tool = 'attach_drive_file_to_draft';
+      const tool = 'attach-drive-file-to-draft';
       const draftId = str(params.draftMessageId);
       const driveId = str(params.driveId);
       const itemId = str(params.itemId);
@@ -756,9 +756,9 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
     },
   },
   {
-    name: 'attach_mail_attachment_to_draft',
+    name: 'attach-mail-attachment-to-draft',
     method: 'POST',
-    path: 'tool:attach_mail_attachment_to_draft',
+    path: 'tool:attach-mail-attachment-to-draft',
     searchKeywords:
       'copy attachment from one email to a draft forward attachment to draft attach received attachment',
     description:
@@ -776,7 +776,7 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
           .describe('Name the attachment shows on the draft. Defaults to the source name.'),
       }),
     execute: async (params, ctx) => {
-      const tool = 'attach_mail_attachment_to_draft';
+      const tool = 'attach-mail-attachment-to-draft';
       const sourceId = str(params.sourceMessageId);
       const attachmentId = str(params.attachmentId);
       const draftId = str(params.draftMessageId);
@@ -816,9 +816,9 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
     },
   },
   {
-    name: 'find_matter_folder',
+    name: 'find-matter-folder',
     method: 'GET',
-    path: 'tool:find_matter_folder',
+    path: 'tool:find-matter-folder',
     searchKeywords: 'find matter folder client folder sharepoint matters locate case folder',
     description:
       'Find a client or matter folder under the firm Matters root (client folders, then matter or sub-client folders, two levels deep) by case-insensitive substring match on folder names. Returns [{ client, matter, itemId, driveId, path, webUrl, exact }], exact matches first. matter is null for a client-level folder.',
@@ -836,7 +836,7 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
           .describe('Most results to return (default 10, max 50).'),
       }),
     execute: async (params, ctx) => {
-      const tool = 'find_matter_folder';
+      const tool = 'find-matter-folder';
       const query = str(params.query)?.toLowerCase();
       if (!query) return fail('query is required.');
       const maxRaw = params.maxResults ?? 10;
