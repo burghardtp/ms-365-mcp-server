@@ -5,3 +5,8 @@
 if (typeof (globalThis as { File?: unknown }).File === 'undefined') {
   (globalThis as { File?: unknown }).File = class File {};
 }
+
+// The server-side send gate (src/send-gate.ts) refuses every send when GATE_CHECK_URL
+// is unset. Suites that exercise send tools for other reasons run with it disabled;
+// test/send-gate.test.ts sets the gate env per test.
+if (process.env.GATE_DISABLED === undefined) process.env.GATE_DISABLED = 'true';

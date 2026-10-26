@@ -3,6 +3,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import { queryParameterSchema } from './query-parameter-schema.js';
 import type { api } from '../generated/client.js';
 import { isDestructiveOperation, type DestructiveCheckConfig } from './destructive-ops.js';
+import { GATE_RECORD_PARAM, GATE_RECORD_PARAM_DESCRIPTION, isSendGated } from '../send-gate.js';
 import {
   isFetchAllPagesApplicable,
   isSkiptokenApplicable,
@@ -32,6 +33,7 @@ export interface ToolSchemaConfig extends DestructiveCheckConfig, QueryParamConf
   supportsExpandExtendedProperties?: boolean;
   acceptType?: string;
   nameFilter?: boolean;
+  sendGate?: boolean;
 }
 
 /**
@@ -118,6 +120,17 @@ export function describeToolSchema(
       required: false,
       description: CONFIRM_PARAM_DESCRIPTION,
       schema: { type: 'boolean' },
+    });
+  }
+
+  // Mirrors registerGraphTools: the send and share tools require a send gate record id.
+  if (isSendGated(config)) {
+    params.push({
+      name: GATE_RECORD_PARAM,
+      in: 'Query',
+      required: true,
+      description: GATE_RECORD_PARAM_DESCRIPTION,
+      schema: { type: 'string' },
     });
   }
 

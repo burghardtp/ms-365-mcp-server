@@ -42,6 +42,7 @@ import OboClient from './obo-client.js';
 import { isRejectedAssertion, oboAllowlistRefusal, readOboAllowlist } from './lib/obo-access.js';
 import { requestContext } from './request-context.js';
 import { getSecrets, type AppSecrets } from './secrets.js';
+import { configureSendGate } from './send-gate.js';
 
 const LOOPBACK_HOSTNAMES = ['localhost', '127.0.0.1', '[::1]'];
 
@@ -457,6 +458,14 @@ class MicrosoftGraphServer {
     }
 
     logger.info('Microsoft 365 MCP Server starting...');
+    configureSendGate({
+      publicUrl:
+        this.options.publicUrl ||
+        process.env.MS365_MCP_PUBLIC_URL ||
+        this.options.baseUrl ||
+        process.env.MS365_MCP_BASE_URL ||
+        null,
+    });
 
     // Debug: Check if secrets are loaded
     logger.info('Secrets Check:', {

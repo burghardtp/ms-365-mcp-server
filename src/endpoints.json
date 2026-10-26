@@ -81,6 +81,7 @@
     "pathPattern": "/me/sendMail",
     "method": "post",
     "toolName": "send-mail",
+    "sendGate": true,
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Send"],
     "llmTip": "CRITICAL: Do not try to guess the email address of the recipients. Use the list-users tool to find the email address of the recipients."
@@ -113,6 +114,7 @@
     "pathPattern": "/users/{user-id}/sendMail",
     "method": "post",
     "toolName": "send-shared-mailbox-mail",
+    "sendGate": true,
     "presets": ["work"],
     "workScopes": ["Mail.Send.Shared"],
     "llmTip": "CRITICAL: Do not try to guess the email address of the recipients. Use the list-users tool to find the email address of the recipients."
@@ -331,6 +333,7 @@
     "pathPattern": "/me/messages/{message-id}/forward",
     "method": "post",
     "toolName": "forward-mail-message",
+    "sendGate": true,
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Send"],
     "llmTip": "Forward an email preserving full HTML formatting and attachments. The 'comment' field adds text above the forwarded content. toRecipients is required. Do NOT reconstruct the email manually - this endpoint handles everything server-side."
@@ -339,6 +342,7 @@
     "pathPattern": "/me/messages/{message-id}/reply",
     "method": "post",
     "toolName": "reply-mail-message",
+    "sendGate": true,
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Send"],
     "llmTip": "Reply to an email preserving full HTML formatting. The 'comment' field is your reply text. Do NOT reconstruct the email manually."
@@ -347,6 +351,7 @@
     "pathPattern": "/me/messages/{message-id}/replyAll",
     "method": "post",
     "toolName": "reply-all-mail-message",
+    "sendGate": true,
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Send"],
     "llmTip": "Reply-all preserving full HTML formatting. The 'comment' field is your reply text."
@@ -379,6 +384,8 @@
     "pathPattern": "/me/messages/{message-id}/send",
     "method": "post",
     "toolName": "send-draft-message",
+    "sendGate": true,
+    "draftAttachmentCheck": true,
     "presets": ["mail", "outlook", "personal"],
     "scopes": ["Mail.Send"],
     "llmTip": "No request body needed — just call with the message ID. Draft must exist in Drafts folder."
@@ -742,6 +749,7 @@
     "pathPattern": "/drives/{drive-id}/items/{driveItem-id}/invite",
     "method": "post",
     "toolName": "share-drive-item",
+    "sendGate": true,
     "presets": ["files", "onedrive", "personal"],
     "scopes": ["Files.ReadWrite"],
     "llmTip": "Shares a file or folder with specific users. Body: { recipients: [{ email: 'user@example.com' }], roles: ['read'], sendInvitation: true, message: 'Please review this file.' }. Roles: 'read', 'write', 'owner'. Set requireSignIn to true to require authentication."

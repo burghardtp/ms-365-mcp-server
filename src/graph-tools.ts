@@ -18,6 +18,14 @@ import { api } from './generated/client.js';
 import GraphClient, { getBlobMaxBytes, isBlobOutputEnabled } from './graph-client.js';
 import { FILE_OPS_TOOLS } from './file-ops.js';
 import { PDF_OPS_TOOLS } from './pdf-ops.js';
+import {
+  GATE_RECORD_PARAM,
+  GATE_RECORD_PARAM_DESCRIPTION,
+  isSendGated,
+  logSend,
+  runSendGate,
+  sendSummary,
+} from './send-gate.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
 import { MAX_UPLOAD_BYTES, uploadAttachment } from './lib/attachment-upload.js';
 import { getUploadDirs, openUploadFile, type UploadFile } from './lib/upload-dirs.js';
@@ -128,6 +136,10 @@ interface EndpointConfig {
   maxTop?: number; // Upper bound for $top, enforced in the schema
   nameFilter?: boolean; // Adds a `name` param that filters the returned members by displayName/email
   mentionShorthand?: boolean; // Rewrites <at user-id="..."> in the message body into Graph mentions
+  // Send gate (src/send-gate.ts): a required gateRecordId checked against Paul Context
+  // before the Graph call. draftAttachmentCheck also reads the draft and its attachments.
+  sendGate?: boolean;
+  draftAttachmentCheck?: boolean;
 }
 
 const endpointsData = JSON.parse(
@@ -2606,7 +2618,78 @@ function unalteredTargetError(target: string) {
   };
 }
 
+/**
+ * Send gate wrapper (src/send-gate.ts). The seven send and share tools are refused
+ * unless Paul Context confirms the caller's gateRecordId; every other tool passes
+ * straight through. The gateRecordId param never reaches Graph.
+ */
 async function executeGraphTool(
+  tool: (typeof api.endpoints)[0],
+  config: EndpointConfig | undefined,
+  graphClient: GraphClient,
+  params: Record<string, unknown>,
+  authManager?: AuthManager,
+  userFields?: string[]
+): Promise<CallToolResult> {
+  if (!isSendGated(config)) {
+    return executeGraphToolCore(tool, config, graphClient, params, authManager, userFields);
+  }
+  const { [GATE_RECORD_PARAM]: gateParam, ...graphParams } = params;
+  const gateId = typeof gateParam === 'string' ? gateParam.trim() : '';
+
+  // A missing confirm (MS365_MCP_REQUIRE_CONFIRM) is refused by the core before
+  // anything else; do not spend a gate check on a call that cannot send.
+  if (
+    isConfirmGateEnabled() &&
+    isDestructiveOperation(tool.method, config) &&
+    params.confirm !== true
+  ) {
+    return executeGraphToolCore(tool, config, graphClient, graphParams, authManager, userFields);
+  }
+
+  let accessToken: string | undefined;
+  if (authManager && !authManager.isOAuthModeEnabled() && !getRequestTokens()) {
+    try {
+      accessToken = await authManager.getTokenForAccount(params.account as string | undefined);
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: (err as Error).message }) }],
+        isError: true,
+      };
+    }
+  }
+
+  const outcome = await runSendGate(tool.alias, config, params, graphClient, accessToken);
+  if (!outcome.ok) {
+    logSend(tool.alias, gateId, outcome.facts, 'refused');
+    return outcome.result;
+  }
+  const result = await executeGraphToolCore(
+    tool,
+    config,
+    graphClient,
+    graphParams,
+    authManager,
+    userFields
+  );
+  if (result.isError) {
+    logSend(tool.alias, gateId, outcome.facts, 'graph-error');
+    return result;
+  }
+  logSend(tool.alias, gateId, outcome.facts, 'sent');
+  return {
+    ...result,
+    content: [
+      ...(result.content ?? []),
+      {
+        type: 'text',
+        text: JSON.stringify(sendSummary(tool.alias, outcome.approval, outcome.facts)),
+      },
+    ],
+  };
+}
+
+async function executeGraphToolCore(
   tool: (typeof api.endpoints)[0],
   config: EndpointConfig | undefined,
   graphClient: GraphClient,
@@ -3664,6 +3747,11 @@ export function registerGraphTools(
         .string()
         .describe(getAccountParamDescription(accountNames))
         .optional();
+    }
+
+    // Server-side send gate: the send and share tools take a required record id.
+    if (isSendGated(endpointConfig)) {
+      paramSchema[GATE_RECORD_PARAM] = z.string().describe(GATE_RECORD_PARAM_DESCRIPTION);
     }
 
     // Add includeHeaders parameter for all tools to capture ETags and other headers
