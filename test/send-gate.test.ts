@@ -7,6 +7,7 @@ import {
   bodyText,
   buildTarget,
   factsFromParams,
+  newTextOfBody,
 } from '../src/send-gate.js';
 
 vi.mock('../src/logger.js', () => ({
@@ -325,6 +326,152 @@ describe('server-side send gate', () => {
     expect(summary).not.toHaveProperty('attachments');
   });
 
+  const OUTLOOK_REPLY_HEADER =
+    '<hr style="display:inline-block;width:98%"><p><b>From:</b> Counsel &lt;counsel@example.com&gt;<br>' +
+    '<b>Sent:</b> Monday, October 26, 2026 9:14 AM<br><b>To:</b> Paul Burghardt<br>' +
+    '<b>Subject:</b> Tender of Defense</p>';
+
+  it('passes a reply draft whose only "attached" is in the quoted thread', async () => {
+    draftWith(
+      '<p>Thanks, I will review and respond this week.</p>' +
+        OUTLOOK_REPLY_HEADER +
+        '<p>Please see the attached tender letter and the enclosed policy.</p>',
+      []
+    );
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true, id: 'sg-10' }));
+    const result = await handler('send-draft-message')({
+      gateRecordId: 'sg-10',
+      messageId: 'AAMk10',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(graphRequest).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /tool=send-draft-message gate=sg-10 recipients=2 attachments=0 result=sent/
+      )
+    );
+  });
+
+  it('refuses a reply draft that says "attached" above the quoted thread with no attachment', async () => {
+    draftWith(
+      '<p>The signed release is attached.</p>' +
+        OUTLOOK_REPLY_HEADER +
+        '<p>Can you send the release?</p>',
+      []
+    );
+    const result = await handler('send-draft-message')({
+      gateRecordId: 'sg-11',
+      messageId: 'AAMk11',
+    });
+    expect(result.isError).toBe(true);
+    expect(parse(result).reason).toBe(ATTACHMENT_MISSING_MESSAGE);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(graphRequest).not.toHaveBeenCalled();
+  });
+
+  it('cuts an HTML draft at the divRplyFwdMsg container before testing', async () => {
+    draftWith(
+      '<div>Confirmed, Tuesday works.</div><div id="divRplyFwdMsg" dir="ltr"><font>earlier message</font></div>' +
+        '<div>The enclosed draft is ready for signature.</div>',
+      []
+    );
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true, id: 'sg-12' }));
+    const result = await handler('send-draft-message')({
+      gateRecordId: 'sg-12',
+      messageId: 'AAMk12',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(graphRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses attachmentCheck "skip" without a reason, before reading the draft', async () => {
+    draftWith('<p>The report is attached.</p>', []);
+    for (const extra of [
+      {},
+      { attachmentCheckReason: '   ' },
+      { attachmentCheckReason: 'x'.repeat(201) },
+    ]) {
+      const result = await handler('send-draft-message')({
+        gateRecordId: 'sg-13',
+        messageId: 'AAMk13',
+        attachmentCheck: 'skip',
+        ...extra,
+      });
+      expect(result.isError).toBe(true);
+      expect(String(parse(result).reason)).toContain(
+        'attachmentCheck "skip" requires attachmentCheckReason'
+      );
+    }
+    expect(makeRequest).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(graphRequest).not.toHaveBeenCalled();
+  });
+
+  it('attachmentCheck "skip" with a reason sends, logs the reason, and puts it in the gate target', async () => {
+    draftWith('<p>The report attached to my October 20 email still controls.</p>', []);
+    fetchMock.mockResolvedValue(jsonResponse({ ok: true, id: 'sg-14' }));
+    const result = await handler('send-draft-message')({
+      gateRecordId: 'sg-14',
+      messageId: 'AAMk14',
+      attachmentCheck: 'skip',
+      attachmentCheckReason: 'Refers to the report sent on 10.20, not attached by design.',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(graphRequest).toHaveBeenCalledTimes(1);
+    const [path, options] = graphRequest.mock.calls[0] as [string, { body?: string }];
+    expect(path).toBe('/me/messages/AAMk14/send');
+    expect(options.body ?? '').not.toContain('attachmentCheck');
+    const sent = JSON.parse(
+      String(
+        (fetchMock.mock.calls[0] as [string, { headers: Record<string, string>; body: string }])[1]
+          .body
+      )
+    );
+    expect(sent.target).toContain(
+      'attachment check skipped: Refers to the report sent on 10.20, not attached by design.'
+    );
+    expect(sent.target).toContain('message AAMk14');
+    expect(logger.info).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /tool=send-draft-message gate=sg-14 recipients=2 attachments=0 attachmentCheck=skip reason="Refers to the report sent on 10\.20, not attached by design\." result=sent/
+      )
+    );
+  });
+
+  it('puts attachmentCheck and attachmentCheckReason on send-draft-message only, both optional', () => {
+    registerGraphTools(mockServer as never, graphClient, { orgMode: true });
+    const calls = mockServer.registerTool.mock.calls as Array<
+      [
+        string,
+        {
+          inputSchema: {
+            shape: Record<
+              string,
+              {
+                isOptional(): boolean;
+                description?: string;
+                safeParse(v: unknown): { success: boolean };
+              }
+            >;
+          };
+        },
+      ]
+    >;
+    const withCheck = calls
+      .filter(([, def]) => 'attachmentCheck' in def.inputSchema.shape)
+      .map(([n]) => n);
+    expect(withCheck).toEqual(['send-draft-message']);
+    const shape = calls.find(([n]) => n === 'send-draft-message')![1].inputSchema.shape;
+    expect(shape.attachmentCheck.isOptional()).toBe(true);
+    expect(shape.attachmentCheckReason.isOptional()).toBe(true);
+    expect(shape.attachmentCheck.description).toContain('"skip"');
+    expect(shape.attachmentCheckReason.description).toContain('200 characters');
+    expect(shape.attachmentCheck.safeParse('skip').success).toBe(true);
+    expect(shape.attachmentCheck.safeParse('off').success).toBe(false);
+    expect(shape.attachmentCheckReason.safeParse('x'.repeat(201)).success).toBe(false);
+  });
+
   it('a Graph failure after an ok gate is reported, not echoed as sent', async () => {
     fetchMock.mockResolvedValue(jsonResponse({ ok: true, id: 'sg-7' }));
     graphRequest.mockResolvedValue({
@@ -372,6 +519,40 @@ describe('send gate helpers', () => {
     });
   });
 
+  it('newTextOfBody cuts at each quoted-history marker', () => {
+    expect(
+      newTextOfBody('Sounds good.\n\n-----Original Message-----\nFrom: A\nSee attached.', 'text')
+    ).toBe('Sounds good.');
+    expect(
+      newTextOfBody(
+        'Sounds good.\nOn Mon, Oct 26, 2026 at 9:14 AM Counsel <c@x.com> wrote:\n> attached',
+        'text'
+      )
+    ).toBe('Sounds good.');
+    expect(
+      newTextOfBody('Sounds good.\n________________________________\nFrom: A\nattached', 'text')
+    ).toBe('Sounds good.');
+    expect(
+      newTextOfBody('Sounds good.\nFrom: A\nTo: B\nCc: C\nDate: Mon\nSee attached.', 'text')
+    ).toBe('Sounds good.');
+    // A From: line with no Sent: or Date: within four lines is not a header block.
+    expect(newTextOfBody('From: the client file\nNotes\nattached here', 'text')).toBe(
+      'From: the client file Notes attached here'
+    );
+    expect(
+      newTextOfBody(
+        '<div dir="ltr">Thanks.</div><div class="gmail_quote gmail_quote_container"><div>attached</div></div>',
+        'html'
+      )
+    ).toBe('Thanks.');
+    expect(
+      newTextOfBody('<p>Thanks.</p><div id="appendonsend"></div><hr><div>enclosed</div>', 'html')
+    ).toBe('Thanks.');
+    expect(newTextOfBody('<p>No quoted thread.</p><p>Second line.</p>', 'html')).toBe(
+      'No quoted thread. Second line.'
+    );
+  });
+
   it('caps the gate target at 300 characters', () => {
     const many = Array.from({ length: 40 }, (_, i) => ({
       emailAddress: { address: `person${i}@example.com` },
@@ -395,6 +576,20 @@ describe('send gate in discovery mode', () => {
       return describeToolSchema(tool, cfg).parameters.find((p) => p.name === 'gateRecordId');
     };
     expect(describe('send-draft-message')).toMatchObject({ required: true });
+    const draftTool = api.endpoints.find((e) => e.alias === 'send-draft-message')!;
+    const draftCfg = config.find((c) => c.toolName === 'send-draft-message') as never;
+    const draftParams = describeToolSchema(draftTool, draftCfg).parameters;
+    expect(draftParams.find((p) => p.name === 'attachmentCheck')).toMatchObject({
+      required: false,
+    });
+    expect(draftParams.find((p) => p.name === 'attachmentCheckReason')).toMatchObject({
+      required: false,
+    });
+    const mailTool = api.endpoints.find((e) => e.alias === 'send-mail')!;
+    const mailCfg = config.find((c) => c.toolName === 'send-mail') as never;
+    expect(
+      describeToolSchema(mailTool, mailCfg).parameters.find((p) => p.name === 'attachmentCheck')
+    ).toBeUndefined();
     expect(describe('create-draft-email')).toBeUndefined();
   });
 });

@@ -20,11 +20,12 @@ import { FILE_OPS_TOOLS } from './file-ops.js';
 import { PDF_OPS_TOOLS } from './pdf-ops.js';
 import {
   GATE_RECORD_PARAM,
-  GATE_RECORD_PARAM_DESCRIPTION,
+  gateParamSpecs,
   isSendGated,
   logSend,
   runSendGate,
   sendSummary,
+  withoutGateParams,
 } from './send-gate.js';
 import { getAttachmentMinting } from './lib/attachment-minting.js';
 import { MAX_UPLOAD_BYTES, uploadAttachment } from './lib/attachment-upload.js';
@@ -2634,7 +2635,8 @@ async function executeGraphTool(
   if (!isSendGated(config)) {
     return executeGraphToolCore(tool, config, graphClient, params, authManager, userFields);
   }
-  const { [GATE_RECORD_PARAM]: gateParam, ...graphParams } = params;
+  const gateParam = params[GATE_RECORD_PARAM];
+  const graphParams = withoutGateParams(params);
   const gateId = typeof gateParam === 'string' ? gateParam.trim() : '';
 
   // A missing confirm (MS365_MCP_REQUIRE_CONFIRM) is refused by the core before
@@ -3749,9 +3751,16 @@ export function registerGraphTools(
         .optional();
     }
 
-    // Server-side send gate: the send and share tools take a required record id.
-    if (isSendGated(endpointConfig)) {
-      paramSchema[GATE_RECORD_PARAM] = z.string().describe(GATE_RECORD_PARAM_DESCRIPTION);
+    // Server-side send gate: the send and share tools take a required record id;
+    // send-draft-message also takes attachmentCheck and attachmentCheckReason.
+    for (const spec of gateParamSpecs(endpointConfig)) {
+      let field: z.ZodTypeAny = spec.values
+        ? z.enum(spec.values as [string, ...string[]])
+        : spec.maxLength
+          ? z.string().max(spec.maxLength)
+          : z.string();
+      field = field.describe(spec.description);
+      paramSchema[spec.name] = spec.required ? field : field.optional();
     }
 
     // Add includeHeaders parameter for all tools to capture ETags and other headers

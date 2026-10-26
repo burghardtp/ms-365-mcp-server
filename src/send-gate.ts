@@ -10,8 +10,12 @@
  *
  * send-draft-message also reads the draft and its attachment list first: a body
  * that says something is attached, with no file attachment on the draft, is
- * refused before the gate is asked. The recipients, subject, and attachment
- * names and sizes go into the gate target and into the tool's success response.
+ * refused before the gate is asked. Only the new text is tested: the body is cut
+ * at the first quoted-history marker of a reply or forward (see newTextOfBody).
+ * attachmentCheck "skip" with an attachmentCheckReason turns the test off for one
+ * send; the reason is logged and goes into the gate target. The recipients,
+ * subject, and attachment names and sizes go into the gate target and into the
+ * tool's success response.
  */
 import type GraphClient from './graph-client.js';
 import logger from './logger.js';
@@ -36,6 +40,62 @@ export const ATTACHMENT_MISSING_MESSAGE =
   'The draft says something is attached but carries no attachment.';
 
 export const GATE_NOT_CONFIGURED_MESSAGE = 'send gate is not configured on this server';
+
+export const ATTACHMENT_CHECK_PARAM = 'attachmentCheck';
+export const ATTACHMENT_CHECK_REASON_PARAM = 'attachmentCheckReason';
+export const ATTACHMENT_CHECK_VALUES = ['strict', 'skip'] as const;
+export const ATTACHMENT_CHECK_REASON_MAX = 200;
+
+export const ATTACHMENT_CHECK_PARAM_DESCRIPTION =
+  'Attachment check before the draft is sent. "strict" (the default) refuses a draft whose new text (above any quoted earlier thread) says something is attached or enclosed while the draft carries no file attachment. Use "skip" only when that mention refers, by design, to something not attached to this message (for example a document sent earlier or delivered another way); "skip" requires attachmentCheckReason. Never use "skip" to get past a forgotten attachment.';
+
+export const ATTACHMENT_CHECK_REASON_PARAM_DESCRIPTION =
+  'Required when attachmentCheck is "skip": one line (at most 200 characters) saying why the body mentions an attachment that is not on the draft by design. Logged and sent to the send gate with the record check.';
+
+/** One synthetic parameter the send gate adds to a tool's input schema. */
+export interface GateParamSpec {
+  name: string;
+  required: boolean;
+  description: string;
+  values?: readonly string[];
+  maxLength?: number;
+}
+
+/** The gate parameters a tool takes, in order, for registration and discovery. */
+export function gateParamSpecs(config: SendGateConfig | undefined): GateParamSpec[] {
+  if (!isSendGated(config)) return [];
+  const specs: GateParamSpec[] = [
+    { name: GATE_RECORD_PARAM, required: true, description: GATE_RECORD_PARAM_DESCRIPTION },
+  ];
+  if (config?.draftAttachmentCheck === true) {
+    specs.push(
+      {
+        name: ATTACHMENT_CHECK_PARAM,
+        required: false,
+        description: ATTACHMENT_CHECK_PARAM_DESCRIPTION,
+        values: ATTACHMENT_CHECK_VALUES,
+      },
+      {
+        name: ATTACHMENT_CHECK_REASON_PARAM,
+        required: false,
+        description: ATTACHMENT_CHECK_REASON_PARAM_DESCRIPTION,
+        maxLength: ATTACHMENT_CHECK_REASON_MAX,
+      }
+    );
+  }
+  return specs;
+}
+
+/** The tool arguments with every gate parameter removed, for the Graph call. */
+const GATE_PARAM_NAMES = new Set([
+  GATE_RECORD_PARAM,
+  ATTACHMENT_CHECK_PARAM,
+  ATTACHMENT_CHECK_REASON_PARAM,
+]);
+
+export function withoutGateParams(params: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(params).filter(([key]) => !GATE_PARAM_NAMES.has(key)));
+}
 
 /** A text-only tool result, assignable to the MCP CallToolResult shapes in use. */
 export interface GateRefusal {
@@ -86,6 +146,8 @@ export interface SendFacts {
   bcc: string[];
   subject?: string;
   attachments?: AttachmentFact[];
+  /** Set when the caller passed attachmentCheck "skip"; the caller's reason. */
+  attachmentCheckSkipped?: string;
 }
 
 export interface GateApproval {
@@ -190,6 +252,9 @@ export function buildTarget(
         : 'attachments: none'
     );
   }
+  if (facts.attachmentCheckSkipped) {
+    parts.push(`attachment check skipped: ${facts.attachmentCheckSkipped}`);
+  }
   // File shares carry the drive item as path params; message sends the message id.
   const drive = param(params, 'driveId', 'drive-id');
   const item = param(params, 'driveItemId', 'driveItem-id');
@@ -224,6 +289,85 @@ export function bodyText(content: string, contentType?: string): string {
     })
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * HTML containers that open the quoted earlier thread: Outlook's reply and
+ * forward header (divRplyFwdMsg), Outlook's appendonsend anchor just above it,
+ * and Gmail's quote block. The body is cut at the first one before conversion.
+ */
+const HTML_QUOTE_MARKERS: RegExp[] = [
+  /<div\b[^>]*\bid\s*=\s*["']?divRplyFwdMsg\b/i,
+  /<div\b[^>]*\bid\s*=\s*["']?appendonsend\b/i,
+  /<div\b[^>]*\bclass\s*=\s*["'][^"']*\bgmail_quote\b/i,
+];
+
+/** Line markers in the text: the first matching line starts the quoted thread. */
+const FROM_LINE = /^From:/i;
+const SENT_OR_DATE_LINE = /^(Sent|Date):/i;
+const FROM_HEADER_WINDOW = 4;
+const ORIGINAL_MESSAGE_LINE = /^-{2,}\s*Original Message\s*-{2,}$/i;
+const ON_WROTE_LINE = /^On .{3,200} wrote:$/;
+const OUTLOOK_WEB_DIVIDER = '________________________________';
+
+/** The lines of a message body, HTML converted to text with line breaks kept. Blank lines dropped. */
+export function bodyLines(content: string, contentType?: string): string[] {
+  let text = content;
+  if (!contentType || contentType.toLowerCase() !== 'text') {
+    text = content
+      .replace(/<!--[\s\S]*?-->/g, ' ')
+      .replace(/<(style|script|head)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
+      .replace(/<br\b[^>]*>/gi, '\n')
+      .replace(/<\/?(p|div|tr|li|ul|ol|table|blockquote|h[1-6]|hr)\b[^>]*>/gi, '\n')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, e: string) => {
+        const lower = e.toLowerCase();
+        if (lower.startsWith('#x')) return String.fromCodePoint(parseInt(lower.slice(2), 16));
+        if (lower.startsWith('#')) return String.fromCodePoint(parseInt(lower.slice(1), 10));
+        return ENTITIES[lower] ?? m;
+      });
+  }
+  return text
+    .split(/\r\n|\r|\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter((line) => line.length > 0);
+}
+
+/** Index of the first line that opens a quoted earlier message, or -1. */
+export function quotedHistoryLine(lines: string[]): number {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith(OUTLOOK_WEB_DIVIDER)) return i;
+    if (ORIGINAL_MESSAGE_LINE.test(line)) return i;
+    if (ON_WROTE_LINE.test(line)) return i;
+    if (FROM_LINE.test(line)) {
+      const window = lines.slice(i + 1, i + 1 + FROM_HEADER_WINDOW);
+      if (window.some((l) => SENT_OR_DATE_LINE.test(l))) return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The new text of a draft: the body above the first quoted-history marker, as
+ * plain text on one line. HTML is cut at the first quote container, then
+ * converted; the text is cut at the first marker line (an Outlook From: header
+ * with Sent: or Date: within the next four non-blank lines, an Original Message
+ * rule, an "On ... wrote:" line, or the Outlook web underscore divider).
+ */
+export function newTextOfBody(content: string, contentType?: string): string {
+  let html = content;
+  if (!contentType || contentType.toLowerCase() !== 'text') {
+    let cut = html.length;
+    for (const marker of HTML_QUOTE_MARKERS) {
+      const at = html.search(marker);
+      if (at >= 0 && at < cut) cut = at;
+    }
+    html = html.slice(0, cut);
+  }
+  const lines = bodyLines(html, contentType);
+  const end = quotedHistoryLine(lines);
+  return (end >= 0 ? lines.slice(0, end) : lines).join(' ').replace(/\s+/g, ' ').trim();
 }
 
 interface DraftMessage {
@@ -278,7 +422,7 @@ export async function readDraftFacts(
     ...(draft?.subject ? { subject: draft.subject } : {}),
     attachments,
   };
-  return { facts, text: bodyText(draft?.body?.content ?? '', draft?.body?.contentType) };
+  return { facts, text: newTextOfBody(draft?.body?.content ?? '', draft?.body?.contentType) };
 }
 
 async function askGate(
@@ -372,6 +516,31 @@ export async function runSendGate(
     if (!messageId) {
       return { ok: false, facts, result: refusal(tool, 'messageId is required.') };
     }
+    const rawMode = params[ATTACHMENT_CHECK_PARAM];
+    const mode = rawMode === undefined || rawMode === null ? 'strict' : rawMode;
+    if (mode !== 'strict' && mode !== 'skip') {
+      return {
+        ok: false,
+        facts,
+        result: refusal(tool, 'attachmentCheck must be "strict" or "skip".'),
+      };
+    }
+    let skipReason: string | undefined;
+    if (mode === 'skip') {
+      const rawReason = params[ATTACHMENT_CHECK_REASON_PARAM];
+      const reason = typeof rawReason === 'string' ? rawReason.replace(/\s+/g, ' ').trim() : '';
+      if (!reason || reason.length > ATTACHMENT_CHECK_REASON_MAX) {
+        return {
+          ok: false,
+          facts,
+          result: refusal(
+            tool,
+            `attachmentCheck "skip" requires attachmentCheckReason: a non-empty reason of at most ${ATTACHMENT_CHECK_REASON_MAX} characters.`
+          ),
+        };
+      }
+      skipReason = reason;
+    }
     let draft: { facts: SendFacts; text: string };
     try {
       draft = await readDraftFacts(graph, messageId, accessToken);
@@ -383,8 +552,9 @@ export async function runSendGate(
       };
     }
     facts = draft.facts;
+    if (skipReason) facts.attachmentCheckSkipped = skipReason;
     const files = (facts.attachments ?? []).filter((a) => !a.isInline);
-    if (ATTACHMENT_MENTION_PATTERN.test(draft.text) && files.length === 0) {
+    if (!skipReason && ATTACHMENT_MENTION_PATTERN.test(draft.text) && files.length === 0) {
       return {
         ok: false,
         facts,
@@ -447,7 +617,10 @@ export function logSend(tool: string, gateId: string, facts: SendFacts, result: 
   const attachments = facts.attachments
     ? facts.attachments.filter((a) => !a.isInline).length
     : 'n/a';
+  const skipped = facts.attachmentCheckSkipped
+    ? ` attachmentCheck=skip reason=${JSON.stringify(facts.attachmentCheckSkipped)}`
+    : '';
   logger.info(
-    `send-gate ts=${new Date().toISOString()} tool=${tool} gate=${gateId || '(none)'} recipients=${recipients} attachments=${attachments} result=${result}`
+    `send-gate ts=${new Date().toISOString()} tool=${tool} gate=${gateId || '(none)'} recipients=${recipients} attachments=${attachments}${skipped} result=${result}`
   );
 }

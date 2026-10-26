@@ -3,7 +3,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import { queryParameterSchema } from './query-parameter-schema.js';
 import type { api } from '../generated/client.js';
 import { isDestructiveOperation, type DestructiveCheckConfig } from './destructive-ops.js';
-import { GATE_RECORD_PARAM, GATE_RECORD_PARAM_DESCRIPTION, isSendGated } from '../send-gate.js';
+import { gateParamSpecs } from '../send-gate.js';
 import {
   isFetchAllPagesApplicable,
   isSkiptokenApplicable,
@@ -34,6 +34,7 @@ export interface ToolSchemaConfig extends DestructiveCheckConfig, QueryParamConf
   acceptType?: string;
   nameFilter?: boolean;
   sendGate?: boolean;
+  draftAttachmentCheck?: boolean;
 }
 
 /**
@@ -123,14 +124,19 @@ export function describeToolSchema(
     });
   }
 
-  // Mirrors registerGraphTools: the send and share tools require a send gate record id.
-  if (isSendGated(config)) {
+  // Mirrors registerGraphTools: the send and share tools require a send gate record id,
+  // and send-draft-message takes the optional attachment check params.
+  for (const spec of gateParamSpecs(config)) {
     params.push({
-      name: GATE_RECORD_PARAM,
+      name: spec.name,
       in: 'Query',
-      required: true,
-      description: GATE_RECORD_PARAM_DESCRIPTION,
-      schema: { type: 'string' },
+      required: spec.required,
+      description: spec.description,
+      schema: {
+        type: 'string',
+        ...(spec.values ? { enum: [...spec.values] } : {}),
+        ...(spec.maxLength ? { maxLength: spec.maxLength } : {}),
+      },
     });
   }
 
