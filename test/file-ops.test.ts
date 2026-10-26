@@ -17,6 +17,9 @@ import { UTILITY_TOOLS } from '../src/graph-tools.js';
 import {
   __resetMattersRootCacheForTests,
   DEFAULT_MATTERS_DRIVE_ID,
+  emlFileName,
+  firmDate,
+  stripReplyPrefixes,
   FILE_OPS_MAX_BYTES,
   sharePointSafeName,
   UPLOAD_CHUNK_BYTES,
@@ -134,6 +137,7 @@ afterEach(() => {
   delete process.env.MATTERS_DRIVE_ID;
   delete process.env.MATTERS_ROOT_PATH;
   delete process.env.MATTERS_GROUPING_FOLDERS;
+  delete process.env.FIRM_TIME_ZONE;
 });
 
 const ATT_META = `${G}/me/messages/MSG1/attachments/ATT1?$select=id,name,contentType,size`;
@@ -816,5 +820,288 @@ describe('find-matter-folder', () => {
     const r = await t().execute({ query: 'x' }, makeCtx());
     expect(r.isError).toBe(true);
     expect(parse(r).error).toMatch(/Matters root "GC Associates\/Matters" .* was not found/);
+  });
+});
+
+describe('file-email-to-matter naming', () => {
+  it('strips reply and forward prefixes repeatedly', () => {
+    expect(stripReplyPrefixes('RE: FW: Re[2]: Fwd:  Tender of Defense')).toBe('Tender of Defense');
+    expect(stripReplyPrefixes('Regarding the lease')).toBe('Regarding the lease');
+    expect(stripReplyPrefixes('Fwd: ')).toBe('');
+  });
+
+  it('dates in Denver time, not UTC', () => {
+    // 03:30 UTC on 10.22 is 21:30 MDT on 10.21.
+    expect(firmDate('2026-10-22T03:30:00Z')).toBe('2026-10-21');
+    expect(firmDate('2026-10-22T07:00:00Z')).toBe('2026-10-22');
+    process.env.FIRM_TIME_ZONE = 'UTC';
+    expect(firmDate('2026-10-22T03:30:00Z')).toBe('2026-10-22');
+  });
+
+  it('builds a SharePoint-safe name capped at 120 characters', () => {
+    expect(
+      emlFileName('RE: FW: Tender of Defense: Hatch v. Bridge #15 <draft>?', '2026-10-21')
+    ).toBe('2026-10-21 Tender of Defense Hatch v. Bridge 15 draft.eml');
+    expect(emlFileName('', '2026-10-21')).toBe('2026-10-21 (no subject).eml');
+    const long = emlFileName('Re: ' + 'word '.repeat(60), '2026-10-21');
+    expect(long.length).toBeLessThanOrEqual(120);
+    expect(long.endsWith('.eml')).toBe(true);
+    expect(long).not.toMatch(/\s\.eml$/);
+    expect(long.startsWith('2026-10-21 word word')).toBe(true);
+  });
+});
+
+describe('file-email-to-matter', () => {
+  const t = () => tool('file-email-to-matter');
+  const D = 'DRV';
+  const MSG_META = `${G}/me/messages/MSG1?$select=id,subject,receivedDateTime,sentDateTime`;
+  const MIME = `${G}/me/messages/MSG1/$value`;
+  const EMAILS_LOOKUP = `${G}/drives/${D}/items/MATTER:/Emails?$select=id,name,webUrl,folder,file`;
+  const ATT_LIST = `${G}/me/messages/MSG1/attachments?$select=id,name,contentType,size,isInline`;
+  const mime = Buffer.from(
+    'From: a@example.com\r\nSubject: RE: Tender: Hatch\r\nContent-Type: text/plain\r\n\r\nBody\r\n'
+  );
+
+  function mockMessage(
+    attachments: Array<Record<string, unknown>> = [],
+    subject = 'RE: Tender: Hatch'
+  ) {
+    on('GET', MSG_META, () =>
+      json({ id: 'MSG1', subject, receivedDateTime: '2026-10-22T03:30:00Z' })
+    );
+    on('GET', MIME, () => binary(mime, 'message/rfc822'));
+    on('GET', ATT_LIST, () => json({ value: attachments }));
+  }
+
+  function mockPut(folderId: string) {
+    const puts: Call[] = [];
+    on('PUT', new RegExp(`/drives/${D}/items/${folderId}:/[^/]+:/content\\?`), (call) => {
+      puts.push(call);
+      const name = decodeURIComponent(
+        (call.url.match(/\/items\/[^:]+:\/([^:]+):\/content/) ?? [])[1] ?? ''
+      );
+      return json({
+        id: `ITEM-${puts.length}`,
+        name,
+        size: (call.body as Buffer).length,
+        webUrl: `https://sp/${folderId}/${encodeURIComponent(name)}`,
+      });
+    });
+    return puts;
+  }
+
+  it('creates Emails, saves the .eml there and the file attachments in the matter folder', async () => {
+    const pdf = bytes(1200);
+    mockMessage([
+      {
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        id: 'ATT1',
+        name: 'Exhibit A.pdf',
+        size: 1200,
+        isInline: false,
+      },
+      {
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        id: 'IMG',
+        name: 'image001.png',
+        size: 900,
+        isInline: true,
+      },
+      {
+        '@odata.type': '#microsoft.graph.referenceAttachment',
+        id: 'REF',
+        name: 'Shared.docx',
+        isInline: false,
+      },
+    ]);
+    mockAttachment(pdf);
+    on('GET', EMAILS_LOOKUP, () => graphError(404, 'itemNotFound'));
+    const creates: Call[] = [];
+    on('POST', `${G}/drives/${D}/items/MATTER/children`, (call) => {
+      creates.push(call);
+      return json({ id: 'EMAILS', name: 'Emails', webUrl: 'https://sp/Emails', folder: {} }, 201);
+    });
+    const emlPuts = mockPut('EMAILS');
+    const attPuts = mockPut('MATTER');
+
+    const r = await t().execute(
+      { messageId: 'MSG1', driveId: D, folderItemId: 'MATTER' },
+      makeCtx()
+    );
+    expect(r.isError).toBeFalsy();
+    const out = parse(r);
+    expect(creates).toHaveLength(1);
+    expect(JSON.parse(creates[0].body as string)).toEqual({
+      name: 'Emails',
+      folder: {},
+      '@microsoft.graph.conflictBehavior': 'fail',
+    });
+    expect(emlPuts).toHaveLength(1);
+    expect(emlPuts[0].url).toContain(':/2026-10-21%20Tender%20Hatch.eml:/content');
+    expect(emlPuts[0].url).toContain('conflictBehavior=rename');
+    expect(Buffer.compare(emlPuts[0].body as Buffer, mime)).toBe(0);
+    expect(attPuts).toHaveLength(1);
+    expect(attPuts[0].url).toContain(
+      ':/Exhibit%20A.pdf:/content?@microsoft.graph.conflictBehavior=rename'
+    );
+    expect(Buffer.compare(attPuts[0].body as Buffer, pdf)).toBe(0);
+    expect(out.items).toEqual([
+      {
+        kind: 'eml',
+        itemId: 'ITEM-1',
+        name: '2026-10-21 Tender Hatch.eml',
+        size: mime.length,
+        webUrl: 'https://sp/EMAILS/2026-10-21%20Tender%20Hatch.eml',
+      },
+      {
+        kind: 'attachment',
+        itemId: 'ITEM-1',
+        name: 'Exhibit A.pdf',
+        size: 1200,
+        webUrl: 'https://sp/MATTER/Exhibit%20A.pdf',
+        sourceAttachmentId: 'ATT1',
+      },
+    ]);
+    expect(out.skipped).toEqual([
+      { name: 'image001.png', reason: 'inline (embedded in the message body)' },
+      { name: 'Shared.docx', reason: 'cloud link (reference attachment), not a file' },
+    ]);
+    expect(out.failed).toEqual([]);
+    expect(out.emailsFolder).toEqual({
+      itemId: 'EMAILS',
+      webUrl: 'https://sp/Emails',
+      created: true,
+    });
+    const lines = logLines.filter((l) => l.includes('"tool":"file-email-to-matter"'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('written:2 skipped:2 failed:0');
+    noBase64(r, pdf);
+  });
+
+  it('uses an existing Emails folder and never sends replace', async () => {
+    mockMessage([]);
+    on('GET', EMAILS_LOOKUP, () => json({ id: 'EMAILS', name: 'Emails', folder: {} }));
+    const puts = mockPut('EMAILS');
+    const r = await t().execute(
+      { messageId: 'MSG1', driveId: D, folderItemId: 'MATTER' },
+      makeCtx()
+    );
+    expect(parse(r).emailsFolder.created).toBe(false);
+    expect(calls.some((c) => c.method === 'POST')).toBe(false);
+    expect(puts).toHaveLength(1);
+    expect(calls.some((c) => c.url.includes('conflictBehavior=replace'))).toBe(false);
+  });
+
+  it('refuses when "Emails" is a file, writing nothing', async () => {
+    mockMessage([]);
+    on('GET', EMAILS_LOOKUP, () => json({ id: 'F', name: 'Emails', file: {} }));
+    const r = await t().execute(
+      { messageId: 'MSG1', driveId: D, folderItemId: 'MATTER' },
+      makeCtx()
+    );
+    expect(r.isError).toBe(true);
+    expect(parse(r).error).toMatch(/"Emails" in folder MATTER is a file/);
+    expect(calls.some((c) => c.method === 'PUT' || c.method === 'POST')).toBe(false);
+  });
+
+  it('saves attachments only when saveEml is false, inline too when asked', async () => {
+    mockMessage([
+      {
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        id: 'ATT1',
+        name: 'logo.png',
+        size: 10,
+        isInline: true,
+      },
+    ]);
+    mockAttachment(bytes(10), 'logo.png');
+    const puts = mockPut('MATTER');
+    const out = parse(
+      await t().execute(
+        {
+          messageId: 'MSG1',
+          driveId: D,
+          folderItemId: 'MATTER',
+          saveEml: false,
+          includeInlineAttachments: true,
+        },
+        makeCtx()
+      )
+    );
+    expect(
+      calls.some(
+        (c) =>
+          c.url.includes(':/Emails') ||
+          (c.url.endsWith('/$value') && c.url.includes('/messages/MSG1/$value'))
+      )
+    ).toBe(false);
+    expect(puts).toHaveLength(1);
+    expect(out.items.map((i: { name: string }) => i.name)).toEqual(['logo.png']);
+    expect(out.emailsFolder).toBeNull();
+  });
+
+  it('skips the attachment list when saveAttachments is false', async () => {
+    mockMessage([]);
+    on('GET', EMAILS_LOOKUP, () => json({ id: 'EMAILS', name: 'Emails', folder: {} }));
+    mockPut('EMAILS');
+    await t().execute(
+      { messageId: 'MSG1', driveId: D, folderItemId: 'MATTER', saveAttachments: false },
+      makeCtx()
+    );
+    expect(calls.some((c) => c.url === ATT_LIST)).toBe(false);
+  });
+
+  it('reports a failed attachment and keeps what was written', async () => {
+    mockMessage([
+      {
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        id: 'GONE',
+        name: 'Missing.pdf',
+        size: 5,
+        isInline: false,
+      },
+    ]);
+    on('GET', EMAILS_LOOKUP, () => json({ id: 'EMAILS', name: 'Emails', folder: {} }));
+    mockPut('EMAILS');
+    const r = await t().execute(
+      { messageId: 'MSG1', driveId: D, folderItemId: 'MATTER' },
+      makeCtx()
+    );
+    expect(r.isError).toBeFalsy();
+    const out = parse(r);
+    expect(out.items).toHaveLength(1);
+    expect(out.failed).toEqual([
+      { name: 'Missing.pdf', error: expect.stringMatching(/not found \(Graph 404\)/) },
+    ]);
+  });
+
+  it('refuses nothing-to-do and missing ids before any Graph call', async () => {
+    expect(
+      parse(
+        await t().execute(
+          {
+            messageId: 'MSG1',
+            driveId: D,
+            folderItemId: 'MATTER',
+            saveEml: false,
+            saveAttachments: false,
+          },
+          makeCtx()
+        )
+      ).error
+    ).toMatch(/Nothing to do/);
+    expect(parse(await t().execute({ messageId: 'MSG1', driveId: D }, makeCtx())).error).toMatch(
+      /required/
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it('names a missing message clearly', async () => {
+    const r = await t().execute(
+      { messageId: 'MSG1', driveId: D, folderItemId: 'MATTER' },
+      makeCtx()
+    );
+    expect(r.isError).toBe(true);
+    expect(parse(r).error).toMatch(/Message MSG1 was not found \(Graph 404\)/);
   });
 });

@@ -107,9 +107,9 @@ describe('Read-Only Mode', () => {
 
     // 4 mocked endpoints (get-schedule skipped: workScopes only, no orgMode) + utilities
     // (parse-teams-url, download-bytes, download-bytes-to-file, get-download-url,
-    // get-upload-url, read-mail-text, and the four firm file tools)
+    // get-upload-url, read-mail-text, and the five firm file tools)
     expect(mockServer.registerTool).toHaveBeenCalledTimes(4);
-    expect(mockServer.tool).toHaveBeenCalledTimes(10);
+    expect(mockServer.tool).toHaveBeenCalledTimes(11);
 
     const toolCalls = mockServer.registerTool.mock.calls.map((call: unknown[]) => call[0]);
     expect(toolCalls).toContain('list-mail-messages');

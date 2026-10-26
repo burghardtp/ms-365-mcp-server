@@ -109,6 +109,7 @@ const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
   'attach-drive-file-to-draft': ['mail', 'outlook', 'files', 'onedrive', 'personal', 'work'],
   'attach-mail-attachment-to-draft': ['mail', 'outlook', 'personal', 'work'],
   'find-matter-folder': ['files', 'onedrive', 'personal', 'work'],
+  'file-email-to-matter': ['mail', 'outlook', 'files', 'onedrive', 'personal', 'work'],
 };
 
 // Fail fast if a scoped utility references a preset that does not exist (e.g. a typo like

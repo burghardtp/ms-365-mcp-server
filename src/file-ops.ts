@@ -9,6 +9,7 @@
  *   attach-drive-file-to-draft       drive file -> draft message attachment
  *   attach-mail-attachment-to-draft  mail attachment -> draft message attachment
  *   find-matter-folder               search the Matters tree (three levels under grouping folders)
+ *   file-email-to-matter             message (.eml) and its attachments -> matter folder
  *
  * Every call writes one log line: { ts, tool, source, destination, size }.
  */
@@ -43,7 +44,7 @@ export const DEFAULT_MATTERS_DRIVE_ID =
 export const DEFAULT_MATTERS_ROOT_PATH = 'GC Associates/Matters';
 
 const CONFLICT_BEHAVIORS = ['rename', 'fail', 'replace'] as const;
-type ConflictBehavior = (typeof CONFLICT_BEHAVIORS)[number];
+export type ConflictBehavior = (typeof CONFLICT_BEHAVIORS)[number];
 
 interface ToolResult {
   content: Array<{ type: 'text'; text: string }>;
@@ -52,17 +53,22 @@ interface ToolResult {
 }
 
 /** A failure the tool reports to the caller as a plain, clear message. */
-class FileOpsError extends Error {}
+export class FileOpsError extends Error {}
 
-function ok(payload: unknown): ToolResult {
+export function ok(payload: unknown): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
 }
 
-function fail(message: string): ToolResult {
+export function fail(message: string): ToolResult {
   return { content: [{ type: 'text', text: JSON.stringify({ error: message }) }], isError: true };
 }
 
-function logOp(tool: string, source: string, destination: string, size: number | null): void {
+export function logOp(
+  tool: string,
+  source: string,
+  destination: string,
+  size: number | null
+): void {
   logger.info(
     `[file-ops] ${JSON.stringify({ ts: new Date().toISOString(), tool, source, destination, size })}`
   );
@@ -87,7 +93,7 @@ export function sharePointSafeName(name: string): string {
   return cleaned;
 }
 
-function enc(id: string): string {
+export function enc(id: string): string {
   return encodeURIComponent(id);
 }
 
@@ -99,7 +105,7 @@ function encodePath(p: string): string {
     .join('/');
 }
 
-function statusOf(error: unknown): number | undefined {
+export function statusOf(error: unknown): number | undefined {
   const e = error as { httpStatus?: unknown; message?: unknown };
   if (typeof e?.httpStatus === 'number') return e.httpStatus;
   const m = typeof e?.message === 'string' ? e.message.match(/API error: (\d{3})\b/) : null;
@@ -107,7 +113,7 @@ function statusOf(error: unknown): number | undefined {
 }
 
 /** Turn a Graph failure into a message that names the thing that was not found or refused. */
-function describe(error: unknown, what: string): string {
+export function describe(error: unknown, what: string): string {
   if (error instanceof FileOpsError) return error.message;
   const status = statusOf(error);
   const raw = (error as Error)?.message ?? String(error);
@@ -123,7 +129,10 @@ function describe(error: unknown, what: string): string {
  * request-scoped bearer token in HTTP/OAuth mode, the selected cached account in
  * stdio mode. A missing token is refused before any Graph call.
  */
-async function resolveToken(ctx: UtilityToolContext, account: string | undefined): Promise<string> {
+export async function resolveToken(
+  ctx: UtilityToolContext,
+  account: string | undefined
+): Promise<string> {
   const { authManager } = ctx;
   const contextToken = getRequestTokens()?.accessToken;
   try {
@@ -152,7 +161,7 @@ async function resolveToken(ctx: UtilityToolContext, account: string | undefined
   }
 }
 
-async function graphJson<T>(
+export async function graphJson<T>(
   graph: GraphClient,
   token: string,
   endpoint: string,
@@ -173,11 +182,16 @@ async function graphJson<T>(
 }
 
 /** Read Graph byte content into memory, refusing past FILE_OPS_MAX_BYTES. */
-async function graphBytes(graph: GraphClient, token: string, endpoint: string): Promise<Buffer> {
+export async function graphBytes(
+  graph: GraphClient,
+  token: string,
+  endpoint: string,
+  maxBytes: number = FILE_OPS_MAX_BYTES
+): Promise<Buffer> {
   const res = await graph.downloadStream(endpoint, { accessToken: token });
-  if (res.contentLength !== null && res.contentLength > FILE_OPS_MAX_BYTES) {
+  if (res.contentLength !== null && res.contentLength > maxBytes) {
     await res.body.cancel().catch(() => undefined);
-    throw new FileOpsError(tooLarge(res.contentLength));
+    throw new FileOpsError(tooLarge(res.contentLength, maxBytes));
   }
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -186,17 +200,17 @@ async function graphBytes(graph: GraphClient, token: string, endpoint: string): 
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > FILE_OPS_MAX_BYTES) {
+    if (total > maxBytes) {
       await reader.cancel().catch(() => undefined);
-      throw new FileOpsError(tooLarge(total));
+      throw new FileOpsError(tooLarge(total, maxBytes));
     }
     chunks.push(value);
   }
   return Buffer.concat(chunks);
 }
 
-function tooLarge(size: number): string {
-  return `File is ${size} bytes, over the 150 MB (${FILE_OPS_MAX_BYTES} bytes) limit for these tools. Move it in the browser instead.`;
+export function tooLarge(size: number, maxBytes: number = FILE_OPS_MAX_BYTES): string {
+  return `File is ${size} bytes, over the ${Math.round(maxBytes / MB)} MB (${maxBytes} bytes) limit for this tool. Move it in the browser instead.`;
 }
 
 /** PUT the buffer to a pre-authenticated upload session URL in ranges. Returns the last response. */
@@ -241,7 +255,7 @@ async function uploadInRanges(
 // ---------------------------------------------------------------------------
 // Sources
 
-interface SourceFile {
+export interface SourceFile {
   bytes: Buffer;
   name: string;
   contentType: string;
@@ -256,11 +270,12 @@ interface AttachmentMeta {
   size?: number;
 }
 
-async function readMailAttachment(
+export async function readMailAttachment(
   graph: GraphClient,
   token: string,
   messageId: string,
-  attachmentId: string
+  attachmentId: string,
+  maxBytes: number = FILE_OPS_MAX_BYTES
 ): Promise<SourceFile> {
   const base = `/me/messages/${enc(messageId)}/attachments/${enc(attachmentId)}`;
   const label = `message:${messageId}/attachment:${attachmentId}`;
@@ -281,12 +296,12 @@ async function readMailAttachment(
       `Attachment "${meta.name ?? attachmentId}" is a cloud link (reference attachment), not a file. Open the linked file instead.`
     );
   }
-  if (typeof meta.size === 'number' && meta.size > FILE_OPS_MAX_BYTES) {
-    throw new FileOpsError(tooLarge(meta.size));
+  if (typeof meta.size === 'number' && meta.size > maxBytes) {
+    throw new FileOpsError(tooLarge(meta.size, maxBytes));
   }
   let bytes: Buffer;
   try {
-    bytes = await graphBytes(graph, token, `${base}/$value`);
+    bytes = await graphBytes(graph, token, `${base}/$value`, maxBytes);
   } catch (error) {
     throw new FileOpsError(describe(error, `Attachment ${attachmentId} content`));
   }
@@ -309,11 +324,12 @@ interface DriveItemMeta {
   folder?: unknown;
 }
 
-async function readDriveFile(
+export async function readDriveFile(
   graph: GraphClient,
   token: string,
   driveId: string,
-  itemId: string
+  itemId: string,
+  maxBytes: number = FILE_OPS_MAX_BYTES
 ): Promise<SourceFile> {
   const base = `/drives/${enc(driveId)}/items/${enc(itemId)}`;
   let meta: DriveItemMeta;
@@ -329,12 +345,12 @@ async function readDriveFile(
   if (meta.folder !== undefined || meta.file === undefined) {
     throw new FileOpsError(`Drive item "${meta.name ?? itemId}" is a folder, not a file.`);
   }
-  if (typeof meta.size === 'number' && meta.size > FILE_OPS_MAX_BYTES) {
-    throw new FileOpsError(tooLarge(meta.size));
+  if (typeof meta.size === 'number' && meta.size > maxBytes) {
+    throw new FileOpsError(tooLarge(meta.size, maxBytes));
   }
   let bytes: Buffer;
   try {
-    bytes = await graphBytes(graph, token, `${base}/content`);
+    bytes = await graphBytes(graph, token, `${base}/content`, maxBytes);
   } catch (error) {
     throw new FileOpsError(describe(error, `Drive item ${itemId} content`));
   }
@@ -445,14 +461,14 @@ async function attachToDraft(
   return { attachmentId, name, size, method: 'uploadSession' };
 }
 
-interface DriveWriteResult {
+export interface DriveWriteResult {
   id?: string;
   name?: string;
   size?: number;
   webUrl?: string;
 }
 
-async function writeToDrive(
+export async function writeToDrive(
   graph: GraphClient,
   token: string,
   driveId: string,
@@ -637,9 +653,140 @@ function describeNode(
 }
 
 // ---------------------------------------------------------------------------
+// Filing an email to a matter folder
+
+export const EML_NAME_MAX_CHARS = 120;
+export const EMAILS_FOLDER_NAME = 'Emails';
+export const DEFAULT_FIRM_TIME_ZONE = 'America/Denver';
+
+/** Remove leading reply and forward prefixes (Re:, RE:, Fw:, FWD:, Re[2]:), repeatedly. */
+export function stripReplyPrefixes(subject: string): string {
+  let out = subject;
+  const prefix = /^\s*(re|fw|fwd)\s*(\[\d+\])?\s*:\s*/i;
+  while (prefix.test(out)) out = out.replace(prefix, '');
+  return out.trim();
+}
+
+/** yyyy-mm-dd of an ISO timestamp in the firm's time zone (FIRM_TIME_ZONE, default Denver). */
+export function firmDate(iso: string | undefined, now: Date = new Date()): string {
+  const d = iso ? new Date(iso) : now;
+  const when = Number.isNaN(d.getTime()) ? now : d;
+  const timeZone = process.env.FIRM_TIME_ZONE?.trim() || DEFAULT_FIRM_TIME_ZONE;
+  // en-CA formats as yyyy-mm-dd.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(when);
+}
+
+/**
+ * "<yyyy-mm-dd> <subject>.eml": reply and forward prefixes stripped, SharePoint-illegal
+ * characters removed, the whole name capped at 120 characters.
+ */
+export function emlFileName(subject: string | undefined, date: string): string {
+  const cleanSubject = sharePointSafeName(stripReplyPrefixes(subject ?? '')) || '(no subject)';
+  const ext = '.eml';
+  const stem = sharePointSafeName(`${date} ${cleanSubject}`)
+    .slice(0, EML_NAME_MAX_CHARS - ext.length)
+    .replace(/[\s.]+$/g, '');
+  return `${stem}${ext}`;
+}
+
+/** Find the named child folder, creating it when missing. Refuses a file of that name. */
+async function ensureChildFolder(
+  graph: GraphClient,
+  token: string,
+  driveId: string,
+  parentItemId: string,
+  name: string
+): Promise<{ id: string; webUrl?: string; created: boolean }> {
+  const lookup = `/drives/${enc(driveId)}/items/${enc(parentItemId)}:/${enc(name)}?$select=id,name,webUrl,folder,file`;
+  const existing = async (): Promise<{ id: string; webUrl?: string } | undefined> => {
+    try {
+      const item = await graphJson<DriveItemMeta>(graph, token, lookup);
+      if (item.folder === undefined) {
+        throw new FileOpsError(
+          `"${name}" in folder ${parentItemId} is a file, not a folder. Nothing was written.`
+        );
+      }
+      return { id: item.id as string, webUrl: item.webUrl };
+    } catch (error) {
+      if (statusOf(error) === 404) return undefined;
+      throw error;
+    }
+  };
+  const found = await existing();
+  if (found) return { ...found, created: false };
+  try {
+    const made = await graphJson<DriveItemMeta>(
+      graph,
+      token,
+      `/drives/${enc(driveId)}/items/${enc(parentItemId)}/children`,
+      {
+        method: 'POST',
+        body: { name, folder: {}, '@microsoft.graph.conflictBehavior': 'fail' },
+      }
+    );
+    return { id: made.id as string, webUrl: made.webUrl, created: true };
+  } catch (error) {
+    // Created by a parallel call between the lookup and the create.
+    if (statusOf(error) === 409) {
+      const raced = await existing();
+      if (raced) return { ...raced, created: false };
+    }
+    throw error;
+  }
+}
+
+interface MessageAttachmentRow {
+  '@odata.type'?: string;
+  id?: string;
+  name?: string;
+  size?: number;
+  isInline?: boolean;
+}
+
+async function listMessageAttachments(
+  graph: GraphClient,
+  token: string,
+  messageId: string
+): Promise<MessageAttachmentRow[]> {
+  const out: MessageAttachmentRow[] = [];
+  const graphBase = `${getGraphBaseUrl()}/v1.0`;
+  let endpoint: string | undefined =
+    `/me/messages/${enc(messageId)}/attachments?$select=id,name,contentType,size,isInline`;
+  while (endpoint) {
+    const page: { value?: MessageAttachmentRow[]; '@odata.nextLink'?: string } = await graphJson(
+      graph,
+      token,
+      endpoint
+    );
+    out.push(...(page.value ?? []));
+    const next = page['@odata.nextLink'];
+    endpoint = next
+      ? next.startsWith(graphBase)
+        ? next.slice(graphBase.length)
+        : next.replace(/^https:\/\/[^/]+\/v1\.0/, '')
+      : undefined;
+  }
+  return out;
+}
+
+interface FiledItem {
+  kind: 'eml' | 'attachment';
+  itemId?: string;
+  name: string;
+  size: number;
+  webUrl?: string;
+  sourceAttachmentId?: string;
+}
+
+// ---------------------------------------------------------------------------
 // Tool definitions
 
-function withAccount(
+export function withAccount(
   ctx: UtilityToolContext,
   schema: Record<string, z.ZodTypeAny>
 ): Record<string, z.ZodTypeAny> {
@@ -654,7 +801,7 @@ function withAccount(
   return schema;
 }
 
-function str(value: unknown): string | undefined {
+export function str(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
 }
 
@@ -985,6 +1132,213 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
       } catch (error) {
         logOp(tool, `drive:${driveId}/path:${rootPath}`, `query:${query} FAILED`, null);
         return fail(describe(error, 'The Matters folder'));
+      }
+    },
+  },
+  {
+    name: 'file-email-to-matter',
+    method: 'PUT',
+    path: 'tool:file-email-to-matter',
+    searchKeywords:
+      'file email to matter folder save email as eml save message and attachments to sharepoint matter',
+    description:
+      'File an email into a matter folder, server side. Saves the full message (MIME) as <folder>/Emails/<yyyy-mm-dd> <subject>.eml (Denver date of receipt, Re/Fw prefixes and SharePoint-illegal characters removed, name capped at 120 characters), creating the Emails folder if missing, then saves each file attachment into the folder itself. Never overwrites: a name that already exists is saved as a renamed copy. Inline images (signature logos) and cloud-link attachments are skipped unless includeInlineAttachments is true; skipped items are listed. Returns { items: [{ kind, itemId, name, size, webUrl }], skipped, failed, emailsFolder }.',
+    readOnlyHint: false,
+    openWorldHint: true,
+    buildSchema: (ctx) =>
+      withAccount(ctx, {
+        messageId: z.string().describe('Id of the message to file.'),
+        driveId: z.string().describe('Drive id of the matter folder.'),
+        folderItemId: z
+          .string()
+          .describe('Item id of the matter folder (find-matter-folder returns it).'),
+        saveEml: z
+          .boolean()
+          .optional()
+          .describe('Save the message as an .eml in the Emails sub-folder (default true).'),
+        saveAttachments: z
+          .boolean()
+          .optional()
+          .describe('Save each file attachment into the matter folder (default true).'),
+        includeInlineAttachments: z
+          .boolean()
+          .optional()
+          .describe('Also save inline attachments such as signature images (default false).'),
+      }),
+    execute: async (params, ctx) => {
+      const tool = 'file-email-to-matter';
+      const messageId = str(params.messageId);
+      const driveId = str(params.driveId);
+      const folderItemId = str(params.folderItemId);
+      if (!messageId || !driveId || !folderItemId) {
+        return fail('messageId, driveId, and folderItemId are required.');
+      }
+      const saveEml = params.saveEml ?? true;
+      const saveAttachments = params.saveAttachments ?? true;
+      const includeInline = params.includeInlineAttachments ?? false;
+      if (
+        typeof saveEml !== 'boolean' ||
+        typeof saveAttachments !== 'boolean' ||
+        typeof includeInline !== 'boolean'
+      ) {
+        return fail(
+          'saveEml, saveAttachments, and includeInlineAttachments must be true or false.'
+        );
+      }
+      if (!saveEml && !saveAttachments) {
+        return fail('Nothing to do: saveEml and saveAttachments are both false.');
+      }
+      const source = `message:${messageId}`;
+      const destination = `drive:${driveId}/item:${folderItemId}`;
+      const items: FiledItem[] = [];
+      const skipped: Array<{ name: string; reason: string }> = [];
+      const failed: Array<{ name: string; error: string }> = [];
+      let emailsFolder: { itemId: string; webUrl?: string; created: boolean } | null = null;
+      try {
+        const token = await resolveToken(ctx, params.account as string | undefined);
+        let message: { subject?: string; receivedDateTime?: string; sentDateTime?: string };
+        try {
+          message = await graphJson(
+            ctx.graphClient,
+            token,
+            `/me/messages/${enc(messageId)}?$select=id,subject,receivedDateTime,sentDateTime`
+          );
+        } catch (error) {
+          throw new FileOpsError(describe(error, `Message ${messageId}`));
+        }
+
+        if (saveEml) {
+          let folder: { id: string; webUrl?: string; created: boolean };
+          try {
+            folder = await ensureChildFolder(
+              ctx.graphClient,
+              token,
+              driveId,
+              folderItemId,
+              EMAILS_FOLDER_NAME
+            );
+          } catch (error) {
+            throw new FileOpsError(describe(error, `Matter folder ${folderItemId}`));
+          }
+          emailsFolder = { itemId: folder.id, webUrl: folder.webUrl, created: folder.created };
+          let mime: Buffer;
+          try {
+            mime = await graphBytes(
+              ctx.graphClient,
+              token,
+              `/me/messages/${enc(messageId)}/$value`
+            );
+          } catch (error) {
+            throw new FileOpsError(describe(error, `Message ${messageId} content`));
+          }
+          const name = emlFileName(
+            message.subject,
+            firmDate(message.receivedDateTime ?? message.sentDateTime)
+          );
+          try {
+            const written = await writeToDrive(
+              ctx.graphClient,
+              token,
+              driveId,
+              { itemId: folder.id },
+              name,
+              mime,
+              'rename'
+            );
+            items.push({
+              kind: 'eml',
+              itemId: written.id,
+              name: written.name ?? name,
+              size: written.size ?? mime.length,
+              webUrl: written.webUrl,
+            });
+          } catch (error) {
+            throw new FileOpsError(describe(error, `Emails folder ${folder.id}`));
+          }
+        }
+
+        if (saveAttachments) {
+          let rows: MessageAttachmentRow[];
+          try {
+            rows = await listMessageAttachments(ctx.graphClient, token, messageId);
+          } catch (error) {
+            throw new FileOpsError(describe(error, `Attachments of message ${messageId}`));
+          }
+          for (const row of rows) {
+            const label = row.name ?? row.id ?? 'attachment';
+            const kind = (row['@odata.type'] ?? '').toLowerCase();
+            if (kind.endsWith('referenceattachment')) {
+              skipped.push({
+                name: label,
+                reason: 'cloud link (reference attachment), not a file',
+              });
+              continue;
+            }
+            if (row.isInline && !includeInline) {
+              skipped.push({ name: label, reason: 'inline (embedded in the message body)' });
+              continue;
+            }
+            try {
+              const file = await readMailAttachment(
+                ctx.graphClient,
+                token,
+                messageId,
+                row.id as string
+              );
+              const fileName = sharePointSafeName(file.name);
+              if (!fileName) throw new FileOpsError('The file name is empty after cleaning.');
+              const written = await writeToDrive(
+                ctx.graphClient,
+                token,
+                driveId,
+                { itemId: folderItemId },
+                fileName,
+                file.bytes,
+                'rename'
+              );
+              items.push({
+                kind: 'attachment',
+                itemId: written.id,
+                name: written.name ?? fileName,
+                size: written.size ?? file.bytes.length,
+                webUrl: written.webUrl,
+                sourceAttachmentId: row.id,
+              });
+            } catch (error) {
+              failed.push({ name: label, error: describe(error, `Attachment "${label}"`) });
+            }
+          }
+        }
+
+        const total = items.reduce((n, i) => n + i.size, 0);
+        logOp(
+          tool,
+          source,
+          `${destination} written:${items.length} skipped:${skipped.length} failed:${failed.length}`,
+          total
+        );
+        const payload = { items, skipped, failed, emailsFolder };
+        if (items.length === 0 && failed.length > 0) {
+          return {
+            content: [
+              { type: 'text', text: JSON.stringify({ error: 'Nothing was written.', ...payload }) },
+            ],
+            isError: true,
+          };
+        }
+        return ok(payload);
+      } catch (error) {
+        logOp(tool, source, `${destination} FAILED written:${items.length}`, null);
+        const message = describe(error, 'The item');
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ error: message, items, skipped, failed, emailsFolder }),
+            },
+          ],
+          isError: true,
+        };
       }
     },
   },
