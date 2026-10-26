@@ -8,7 +8,7 @@
  *   save-attachment-to-drive         mail attachment -> drive folder
  *   attach-drive-file-to-draft       drive file -> draft message attachment
  *   attach-mail-attachment-to-draft  mail attachment -> draft message attachment
- *   find-matter-folder               search the Matters tree two levels deep
+ *   find-matter-folder               search the Matters tree (three levels under grouping folders)
  *
  * Every call writes one log line: { ts, tool, source, destination, size }.
  */
@@ -564,14 +564,76 @@ async function mapLimit<T, R>(
   return results;
 }
 
+export const DEFAULT_MATTERS_GROUPING_FOLDERS = 'Other,Customers,Litigation,Insurance Claims';
+
+/**
+ * Top-level Matters folders that group clients rather than being clients themselves
+ * (Matters/Other/Bodec/NBU Public Information Request). The search descends a third
+ * level under these. MATTERS_GROUPING_FOLDERS overrides the list (comma separated).
+ */
+export function mattersGroupingFolders(): Set<string> {
+  const raw = process.env.MATTERS_GROUPING_FOLDERS ?? DEFAULT_MATTERS_GROUPING_FOLDERS;
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s.length > 0)
+  );
+}
+
+export interface MatterChild {
+  name: string;
+  itemId: string;
+  path: string;
+}
+
 export interface MatterMatch {
+  /** Grouping folder the client sits under (e.g. "Other"), or null. */
+  group: string | null;
   client: string;
+  /** Matter folder below the client ("A/B" when two levels down), or null at client level. */
   matter: string | null;
   itemId: string;
   driveId: string;
+  /** Path from the drive root, usable as save-attachment-to-drive folderPath. */
   path: string;
+  /** Path from the Matters root (e.g. "Other/Bodec/NBU Public Information Request"). */
+  mattersPath: string;
+  /** 1 = directly under Matters, 2 = one below, 3 = two below. */
+  depth: number;
   webUrl: string | null;
   exact: boolean;
+  /** Child folders of an exact match, so a sub-folder can be picked without a second search. */
+  children?: MatterChild[];
+}
+
+interface TreeNode {
+  segments: FolderChild[];
+}
+
+function describeNode(
+  node: TreeNode,
+  grouping: Set<string>,
+  driveId: string,
+  rootPath: string
+): Omit<MatterMatch, 'exact' | 'children'> {
+  const names = node.segments.map((s) => s.name ?? '');
+  const leaf = node.segments[node.segments.length - 1];
+  const grouped = names.length >= 2 && grouping.has(names[0].toLowerCase());
+  const group = grouped ? names[0] : null;
+  const rest = grouped ? names.slice(1) : names;
+  const mattersPath = names.join('/');
+  return {
+    group,
+    client: rest[0],
+    matter: rest.length > 1 ? rest.slice(1).join('/') : null,
+    itemId: leaf.id as string,
+    driveId,
+    path: `${rootPath}/${mattersPath}`,
+    mattersPath,
+    depth: names.length,
+    webUrl: leaf.webUrl ?? null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -821,7 +883,7 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
     path: 'tool:find-matter-folder',
     searchKeywords: 'find matter folder client folder sharepoint matters locate case folder',
     description:
-      'Find a client or matter folder under the firm Matters root (client folders, then matter or sub-client folders, two levels deep) by case-insensitive substring match on folder names. Returns [{ client, matter, itemId, driveId, path, webUrl, exact }], exact matches first. matter is null for a client-level folder.',
+      'Find a client or matter folder under the firm Matters root by case-insensitive substring match on folder names. Searches two levels (client, then matter) and a third level under grouping folders (MATTERS_GROUPING_FOLDERS, default Other, Customers, Litigation, Insurance Claims) and under folders that matched the query, so Matters/Other/Bodec/NBU Public Information Request is found. Returns [{ group, client, matter, itemId, driveId, path, mattersPath, depth, webUrl, exact, children? }], exact matches first. path is from the drive root (usable as folderPath); mattersPath is from the Matters root. An exact match also lists its child folders [{ name, itemId, path }].',
     readOnlyHint: true,
     openWorldHint: true,
     buildSchema: (ctx) =>
@@ -865,41 +927,58 @@ export const FILE_OPS_TOOLS: UtilityTool[] = [
           root = { id: item.id, webUrl: item.webUrl };
           rootCache.set(cacheKey, root);
         }
-        const clients = await listChildFolders(ctx.graphClient, token, driveId, root.id);
-        const matters = await mapLimit(clients, 8, (c) =>
-          listChildFolders(ctx.graphClient, token, driveId, c.id as string)
-        );
-        const matches: MatterMatch[] = [];
-        clients.forEach((client, i) => {
-          const clientName = client.name ?? '';
-          if (clientName.toLowerCase().includes(query)) {
-            matches.push({
-              client: clientName,
-              matter: null,
-              itemId: client.id as string,
-              driveId,
-              path: `${rootPath}/${clientName}`,
-              webUrl: client.webUrl ?? null,
-              exact: clientName.toLowerCase() === query,
-            });
-          }
-          for (const m of matters[i]) {
-            const matterName = m.name ?? '';
-            if (!matterName.toLowerCase().includes(query)) continue;
-            matches.push({
-              client: clientName,
-              matter: matterName,
-              itemId: m.id as string,
-              driveId,
-              path: `${rootPath}/${clientName}/${matterName}`,
-              webUrl: m.webUrl ?? null,
-              exact: matterName.toLowerCase() === query,
-            });
+        const grouping = mattersGroupingFolders();
+        const hit = (f: FolderChild) => (f.name ?? '').toLowerCase().includes(query);
+        const isExact = (f: FolderChild) => (f.name ?? '').toLowerCase() === query;
+        const list = (f: FolderChild) =>
+          listChildFolders(ctx.graphClient, token, driveId, f.id as string);
+
+        // Levels 1 and 2: every client folder and its children (the original two-level scan).
+        const level1 = await listChildFolders(ctx.graphClient, token, driveId, root.id);
+        const level2 = await mapLimit(level1, 8, list);
+        const nodes: TreeNode[] = [];
+        const childrenOf = new Map<string, FolderChild[]>();
+        const pairs: Array<{ l1: FolderChild; l2: FolderChild }> = [];
+        level1.forEach((l1, i) => {
+          nodes.push({ segments: [l1] });
+          childrenOf.set(l1.id as string, level2[i]);
+          for (const l2 of level2[i]) {
+            nodes.push({ segments: [l1, l2] });
+            pairs.push({ l1, l2 });
           }
         });
+
+        // Level 3: only under grouping folders and under folders that matched the query.
+        const descend = pairs.filter(
+          ({ l1, l2 }) => grouping.has((l1.name ?? '').toLowerCase()) || hit(l1) || hit(l2)
+        );
+        const level3 = await mapLimit(descend, 8, ({ l2 }) => list(l2));
+        descend.forEach(({ l1, l2 }, i) => {
+          childrenOf.set(l2.id as string, level3[i]);
+          for (const l3 of level3[i]) nodes.push({ segments: [l1, l2, l3] });
+        });
+
+        const matched = nodes.filter((n) => hit(n.segments[n.segments.length - 1]));
+        const matches: MatterMatch[] = matched.map((n) => ({
+          ...describeNode(n, grouping, driveId, rootPath),
+          exact: isExact(n.segments[n.segments.length - 1]),
+        }));
         matches.sort((a, b) =>
           a.exact !== b.exact ? (a.exact ? -1 : 1) : a.path.localeCompare(b.path)
         );
+        // Exact matches carry their child folders; a level-3 folder's children cost one call.
+        const exactHits = matches.slice(0, maxRaw).filter((m) => m.exact);
+        await mapLimit(exactHits, 8, async (m) => {
+          let kids = childrenOf.get(m.itemId);
+          if (!kids) kids = await list({ id: m.itemId });
+          m.children = kids
+            .map((k) => ({
+              name: k.name ?? '',
+              itemId: k.id as string,
+              path: `${m.path}/${k.name ?? ''}`,
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        });
         const results = matches.slice(0, maxRaw);
         logOp(tool, `drive:${driveId}/path:${rootPath}`, `query:${query}`, matches.length);
         return ok(results);

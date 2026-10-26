@@ -133,6 +133,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   delete process.env.MATTERS_DRIVE_ID;
   delete process.env.MATTERS_ROOT_PATH;
+  delete process.env.MATTERS_GROUPING_FOLDERS;
 });
 
 const ATT_META = `${G}/me/messages/MSG1/attachments/ATT1?$select=id,name,contentType,size`;
@@ -593,6 +594,8 @@ describe('find-matter-folder', () => {
     );
     const children = (id: string) =>
       `${G}/drives/${d}/items/${id}/children?$select=id,name,webUrl,folder&$top=999`;
+    const folders = (id: string, list: Array<{ id: string; name: string; webUrl?: string }>) =>
+      on('GET', children(id), () => json({ value: list.map((f) => ({ ...f, folder: {} })) }));
     on('GET', children('ROOT'), () =>
       json({
         value: [
@@ -607,46 +610,170 @@ describe('find-matter-folder', () => {
         value: [
           { id: 'C2', name: 'Buckner HeavyLift', webUrl: 'https://sp/Buckner', folder: {} },
           { id: 'C3', name: 'Other', webUrl: 'https://sp/Other', folder: {} },
+          { id: 'C4', name: 'Stuart Awning', webUrl: 'https://sp/Stuart', folder: {} },
         ],
       })
     );
-    on('GET', children('C1'), () =>
-      json({ value: [{ id: 'M1', name: 'NBU Public Information Request', folder: {} }] })
-    );
-    on('GET', children('C2'), () =>
-      json({
-        value: [{ id: 'M2', name: 'Bodec Subcontract', webUrl: 'https://sp/bs', folder: {} }],
-      })
-    );
-    on('GET', children('C3'), () => json({ value: [] }));
+    folders('C1', [{ id: 'M1', name: 'NBU Public Information Request' }]);
+    folders('C2', [{ id: 'M2', name: 'Bodec Subcontract', webUrl: 'https://sp/bs' }]);
+    folders('C3', [
+      { id: 'OB', name: 'Bodec', webUrl: 'https://sp/Other/Bodec' },
+      { id: 'OW', name: 'Whitfield' },
+    ]);
+    folders('C4', [{ id: 'SB', name: 'Bowen' }]);
+    // Third level: under the grouping folder "Other" and under folders that match a query.
+    folders('OB', [
+      { id: 'NBU', name: 'NBU Public Information Request', webUrl: 'https://sp/Other/Bodec/NBU' },
+      { id: 'SUB', name: 'Subcontracts' },
+    ]);
+    folders('OW', []);
+    folders('M1', [{ id: 'X1', name: 'Exhibits' }]);
+    folders('M2', []);
+    folders('SB', []);
+    folders('NBU', [
+      { id: 'N2', name: 'Signed' },
+      { id: 'N1', name: 'Correspondence' },
+    ]);
   }
 
-  it('matches client and matter folders case-insensitively, exact first, files ignored', async () => {
+  const listed = (id: string) =>
+    calls.filter((c) => c.url.includes(`/items/${id}/children`)).length;
+
+  it('matches folders case-insensitively, exact first, files ignored, children on exact hits', async () => {
     mockTree();
     const r = await t().execute({ query: 'Bodec' }, makeCtx());
     expect(r.isError).toBeFalsy();
     const out = parse(r);
     expect(out).toEqual([
       {
+        group: null,
         client: 'BODEC',
         matter: null,
         itemId: 'C1',
         driveId: DEFAULT_MATTERS_DRIVE_ID,
         path: 'GC Associates/Matters/BODEC',
+        mattersPath: 'BODEC',
+        depth: 1,
         webUrl: 'https://sp/BODEC',
         exact: true,
+        children: [
+          {
+            name: 'NBU Public Information Request',
+            itemId: 'M1',
+            path: 'GC Associates/Matters/BODEC/NBU Public Information Request',
+          },
+        ],
       },
       {
+        group: 'Other',
+        client: 'Bodec',
+        matter: null,
+        itemId: 'OB',
+        driveId: DEFAULT_MATTERS_DRIVE_ID,
+        path: 'GC Associates/Matters/Other/Bodec',
+        mattersPath: 'Other/Bodec',
+        depth: 2,
+        webUrl: 'https://sp/Other/Bodec',
+        exact: true,
+        children: [
+          {
+            name: 'NBU Public Information Request',
+            itemId: 'NBU',
+            path: 'GC Associates/Matters/Other/Bodec/NBU Public Information Request',
+          },
+          {
+            name: 'Subcontracts',
+            itemId: 'SUB',
+            path: 'GC Associates/Matters/Other/Bodec/Subcontracts',
+          },
+        ],
+      },
+      {
+        group: null,
         client: 'Buckner HeavyLift',
         matter: 'Bodec Subcontract',
         itemId: 'M2',
         driveId: DEFAULT_MATTERS_DRIVE_ID,
         path: 'GC Associates/Matters/Buckner HeavyLift/Bodec Subcontract',
+        mattersPath: 'Buckner HeavyLift/Bodec Subcontract',
+        depth: 2,
         webUrl: 'https://sp/bs',
         exact: false,
       },
     ]);
     expect(logLines.some((l) => l.includes('"tool":"find-matter-folder"'))).toBe(true);
+  });
+
+  it('reaches a matter three levels down under a grouping folder', async () => {
+    mockTree();
+    const out = parse(await t().execute({ query: 'nbu' }, makeCtx()));
+    expect(out.map((m: { mattersPath: string }) => m.mattersPath)).toEqual([
+      'BODEC/NBU Public Information Request',
+      'Other/Bodec/NBU Public Information Request',
+    ]);
+    expect(out[1]).toMatchObject({
+      group: 'Other',
+      client: 'Bodec',
+      matter: 'NBU Public Information Request',
+      itemId: 'NBU',
+      depth: 3,
+      exact: false,
+    });
+    expect(out[1].children).toBeUndefined();
+  });
+
+  it('lists the children of an exact level-3 match with one extra call', async () => {
+    mockTree();
+    const out = parse(await t().execute({ query: 'NBU Public Information Request' }, makeCtx()));
+    const grouped = out.find((m: { itemId: string }) => m.itemId === 'NBU');
+    expect(grouped.exact).toBe(true);
+    expect(grouped.children).toEqual([
+      {
+        name: 'Correspondence',
+        itemId: 'N1',
+        path: 'GC Associates/Matters/Other/Bodec/NBU Public Information Request/Correspondence',
+      },
+      {
+        name: 'Signed',
+        itemId: 'N2',
+        path: 'GC Associates/Matters/Other/Bodec/NBU Public Information Request/Signed',
+      },
+    ]);
+    expect(listed('NBU')).toBe(1);
+  });
+
+  it('descends a third level only under grouping folders and folders that matched', async () => {
+    mockTree();
+    await t().execute({ query: 'zzz' }, makeCtx());
+    // Grouping folder "Other": its children are listed.
+    expect(listed('OB')).toBe(1);
+    expect(listed('OW')).toBe(1);
+    // Not grouping and no match: no third-level call.
+    expect(listed('M1')).toBe(0);
+    expect(listed('M2')).toBe(0);
+    expect(listed('SB')).toBe(0);
+  });
+
+  it('honors MATTERS_GROUPING_FOLDERS', async () => {
+    process.env.MATTERS_GROUPING_FOLDERS = 'Stuart Awning';
+    // Registered before mockTree so these win over its empty SB listing.
+    on('GET', /\/items\/SB\/children/, () =>
+      json({ value: [{ id: 'BL', name: 'Bowen Letter', folder: {} }] })
+    );
+    on('GET', /\/items\/BL\/children/, () => json({ value: [] }));
+    mockTree();
+    const out = parse(await t().execute({ query: 'bowen letter' }, makeCtx()));
+    expect(out).toEqual([
+      expect.objectContaining({
+        group: 'Stuart Awning',
+        client: 'Bowen',
+        matter: 'Bowen Letter',
+        mattersPath: 'Stuart Awning/Bowen/Bowen Letter',
+        exact: true,
+      }),
+    ]);
+    // "Other" is no longer a grouping folder, so nothing below it is listed.
+    expect(listed('OB')).toBe(0);
   });
 
   it('finds a matter by part of its name, honors maxResults, and resolves the root once', async () => {
@@ -658,6 +785,7 @@ describe('find-matter-folder', () => {
         matter: 'NBU Public Information Request',
         itemId: 'M1',
       }),
+      expect.objectContaining({ client: 'Bodec', group: 'Other', itemId: 'NBU' }),
     ]);
     const r2 = await t().execute({ query: 'b', maxResults: 1 }, makeCtx());
     expect(parse(r2)).toHaveLength(1);
@@ -674,8 +802,11 @@ describe('find-matter-folder', () => {
     expect(parse(r)).toEqual([
       expect.objectContaining({
         client: 'Other',
+        group: null,
         driveId: 'b!OLDRIVE',
         path: 'OL Docs/Clients/Other',
+        mattersPath: 'Other',
+        exact: true,
       }),
     ]);
   });
