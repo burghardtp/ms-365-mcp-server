@@ -3486,6 +3486,25 @@ export interface GraphToolRegistrationOptions {
   userFields?: string;
 }
 
+/**
+ * Filter patterns already logged at info level in this process. Per-request registration
+ * (HTTP/OAuth mode) would otherwise echo the whole pattern on every call.
+ */
+const loggedFilterPatterns = new Set<string>();
+
+/**
+ * Debug-level line. Guarded because several test suites mock the logger with info, warn,
+ * and error only; a missing debug method must never break tool registration.
+ */
+function debugLog(message: string): void {
+  if (typeof logger.debug === 'function') logger.debug(message);
+}
+
+/** Test hook: forget which filter patterns were logged. */
+export function __resetRegistrationLogStateForTests(): void {
+  loggedFilterPatterns.clear();
+}
+
 export function registerGraphTools(
   server: McpServer,
   graphClient: GraphClient,
@@ -3507,7 +3526,14 @@ export function registerGraphTools(
   if (enabledToolsPattern) {
     try {
       enabledToolsRegex = new RegExp(enabledToolsPattern, 'i');
-      logger.info(`Tool filtering enabled with pattern: ${enabledToolsPattern}`);
+      // HTTP/OAuth mode re-registers the tool set on every request, so the full pattern is
+      // logged at info once per process and at debug after that.
+      if (loggedFilterPatterns.has(enabledToolsPattern)) {
+        debugLog(`Tool filtering enabled with pattern: ${enabledToolsPattern}`);
+      } else {
+        loggedFilterPatterns.add(enabledToolsPattern);
+        logger.info(`Tool filtering enabled with pattern: ${enabledToolsPattern}`);
+      }
     } catch {
       logger.error(`Invalid tool filter regex pattern: ${enabledToolsPattern}. Ignoring filter.`);
     }
@@ -3529,7 +3555,7 @@ export function registerGraphTools(
   for (const tool of allEndpoints) {
     const endpointConfig = endpointsData.find((e) => e.toolName === tool.alias);
     if (!orgMode && endpointConfig && !endpointConfig.scopes && endpointConfig.workScopes) {
-      logger.info(`Skipping work account tool ${tool.alias} - not in org mode`);
+      debugLog(`Skipping work account tool ${tool.alias} - not in org mode`);
       skippedCount++;
       continue;
     }
@@ -3540,14 +3566,14 @@ export function registerGraphTools(
       // (e.g. get-schedule, find-meeting-times which are read-only queries via POST).
       // PATCH/DELETE are always blocked in read-only mode.
       if (!(method === 'POST' && endpointConfig?.readOnly)) {
-        logger.info(`Skipping write operation ${tool.alias} in read-only mode`);
+        debugLog(`Skipping write operation ${tool.alias} in read-only mode`);
         skippedCount++;
         continue;
       }
     }
 
     if (enabledToolsRegex && !enabledToolsRegex.test(tool.alias)) {
-      logger.info(`Skipping tool ${tool.alias} - doesn't match filter pattern`);
+      debugLog(`Skipping tool ${tool.alias} - doesn't match filter pattern`);
       skippedCount++;
       continue;
     }
