@@ -59,9 +59,9 @@ describe('Tool Filtering', () => {
 
     // 5 mocked graph endpoints via registerTool; utilities via tool
     // (parse-teams-url, download-bytes, download-bytes-to-file, get-download-url,
-    // get-upload-url, read-mail-text, and the five firm file tools)
+    // get-upload-url, read-mail-text, and the five firm file tools and three PDF tools)
     expect(registerToolSpy).toHaveBeenCalledTimes(5);
-    expect(toolSpy).toHaveBeenCalledTimes(11);
+    expect(toolSpy).toHaveBeenCalledTimes(14);
     expect(registerToolSpy).toHaveBeenCalledWith(
       'list-mail-messages',
       expect.any(Object),
@@ -125,9 +125,9 @@ describe('Tool Filtering', () => {
     registerGraphTools(server, graphClient, { enabledTools: '[invalid regex' });
 
     // 5 mocked endpoints + utilities (no filter applied on invalid regex), including the
-    // five firm file tools
+    // five firm file tools and three PDF tools
     expect(registerToolSpy).toHaveBeenCalledTimes(5);
-    expect(toolSpy).toHaveBeenCalledTimes(11);
+    expect(toolSpy).toHaveBeenCalledTimes(14);
   });
 
   it('should combine read-only and filtering correctly', () => {

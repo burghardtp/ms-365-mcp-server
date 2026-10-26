@@ -86,10 +86,10 @@ describe('Read-Only Mode', () => {
     registerGraphTools(mockServer, {} as GraphClient, { readOnly: options.readOnly });
 
     // 1 GET graph endpoint via registerTool; parse-teams-url + download-bytes +
-    // download-bytes-to-file + get-download-url + read-mail-text + find-matter-folder
-    // utilities via tool
+    // download-bytes-to-file + get-download-url + read-mail-text + find-matter-folder +
+    // pdf-info utilities via tool
     expect(mockServer.registerTool).toHaveBeenCalledTimes(1);
-    expect(mockServer.tool).toHaveBeenCalledTimes(6);
+    expect(mockServer.tool).toHaveBeenCalledTimes(7);
 
     const toolCalls = mockServer.registerTool.mock.calls.map((call: unknown[]) => call[0]);
     expect(toolCalls).toContain('list-mail-messages');
@@ -107,9 +107,9 @@ describe('Read-Only Mode', () => {
 
     // 4 mocked endpoints (get-schedule skipped: workScopes only, no orgMode) + utilities
     // (parse-teams-url, download-bytes, download-bytes-to-file, get-download-url,
-    // get-upload-url, read-mail-text, and the five firm file tools)
+    // get-upload-url, read-mail-text, the five firm file tools, and the three PDF tools)
     expect(mockServer.registerTool).toHaveBeenCalledTimes(4);
-    expect(mockServer.tool).toHaveBeenCalledTimes(11);
+    expect(mockServer.tool).toHaveBeenCalledTimes(14);
 
     const toolCalls = mockServer.registerTool.mock.calls.map((call: unknown[]) => call[0]);
     expect(toolCalls).toContain('list-mail-messages');
@@ -146,9 +146,9 @@ describe('Read-Only Mode', () => {
 
     // 2 graph tools (list-mail-messages + get-schedule) + utilities
     // (parse-teams-url, download-bytes, download-bytes-to-file, get-download-url,
-    // read-mail-text, find-matter-folder)
+    // read-mail-text, find-matter-folder, pdf-info)
     expect(mockServer.registerTool).toHaveBeenCalledTimes(2);
-    expect(mockServer.tool).toHaveBeenCalledTimes(6);
+    expect(mockServer.tool).toHaveBeenCalledTimes(7);
   });
 
   it('reports a readOnly POST endpoint as read-only, not destructive, in its hints', () => {

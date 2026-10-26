@@ -110,6 +110,10 @@ const SCOPED_UTILITY_TOOLS: Record<string, string[]> = {
   'attach-mail-attachment-to-draft': ['mail', 'outlook', 'personal', 'work'],
   'find-matter-folder': ['files', 'onedrive', 'personal', 'work'],
   'file-email-to-matter': ['mail', 'outlook', 'files', 'onedrive', 'personal', 'work'],
+  // Firm PDF tools (src/pdf-ops.ts): drive files in, a new drive file out.
+  'pdf-merge': ['files', 'onedrive', 'personal', 'work'],
+  'pdf-replace-pages': ['files', 'onedrive', 'personal', 'work'],
+  'pdf-info': ['files', 'onedrive', 'personal', 'work'],
 };
 
 // Fail fast if a scoped utility references a preset that does not exist (e.g. a typo like
