@@ -77,6 +77,9 @@ interface GraphRequestOptions {
   // and any other unlisted type come back as UTF-8 text with every invalid byte
   // sequence replaced by U+FFFD, and the file cannot be rebuilt.
   forceBinary?: boolean;
+  // HTTP statuses the caller expects and handles itself (a 404 on an existence
+  // probe). The GraphApiError is still thrown, but logged at debug, not error.
+  quietStatuses?: number[];
   // Stop reading the body past this many bytes and fail with an error naming the limit.
   maxBytes?: number;
   // Answer a binary body as a short JSON text block (name, contentType, size) plus an MCP
@@ -406,7 +409,13 @@ class GraphClient {
 
       return { data: result, metadata };
     } catch (error) {
-      logger.error('Microsoft Graph API request failed:', error);
+      if (error instanceof GraphApiError && options.quietStatuses?.includes(error.httpStatus)) {
+        logger.debug(
+          `Microsoft Graph API request answered ${error.httpStatus} (expected by caller): ${endpoint}`
+        );
+      } else {
+        logger.error('Microsoft Graph API request failed:', error);
+      }
       throw error;
     }
   }

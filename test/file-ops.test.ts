@@ -11,6 +11,7 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 import GraphClient from '../src/graph-client.js';
+import logger from '../src/logger.js';
 import type AuthManager from '../src/auth.js';
 import type { AppSecrets } from '../src/secrets.js';
 import { UTILITY_TOOLS } from '../src/graph-tools.js';
@@ -916,6 +917,7 @@ describe('file-email-to-matter', () => {
     ]);
     mockAttachment(pdf);
     on('GET', EMAILS_LOOKUP, () => graphError(404, 'itemNotFound'));
+    vi.mocked(logger.error).mockClear();
     const creates: Call[] = [];
     on('POST', `${G}/drives/${D}/items/MATTER/children`, (call) => {
       creates.push(call);
@@ -931,6 +933,8 @@ describe('file-email-to-matter', () => {
     expect(r.isError).toBeFalsy();
     const out = parse(r);
     expect(creates).toHaveLength(1);
+    // The existence probe's 404 is the expected path and must not be logged as an error.
+    expect(vi.mocked(logger.error)).not.toHaveBeenCalled();
     expect(JSON.parse(creates[0].body as string)).toEqual({
       name: 'Emails',
       folder: {},

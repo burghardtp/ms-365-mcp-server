@@ -165,7 +165,12 @@ export async function graphJson<T>(
   graph: GraphClient,
   token: string,
   endpoint: string,
-  options: { method?: string; body?: unknown; headers?: Record<string, string> } = {}
+  options: {
+    method?: string;
+    body?: unknown;
+    headers?: Record<string, string>;
+    quietStatuses?: number[];
+  } = {}
 ): Promise<T> {
   const body =
     options.body === undefined
@@ -178,6 +183,7 @@ export async function graphJson<T>(
     method: options.method ?? 'GET',
     ...(body !== undefined ? { body } : {}),
     ...(options.headers ? { headers: options.headers } : {}),
+    ...(options.quietStatuses ? { quietStatuses: options.quietStatuses } : {}),
   })) as T;
 }
 
@@ -705,7 +711,8 @@ async function ensureChildFolder(
   const lookup = `/drives/${enc(driveId)}/items/${enc(parentItemId)}:/${enc(name)}?$select=id,name,webUrl,folder,file`;
   const existing = async (): Promise<{ id: string; webUrl?: string } | undefined> => {
     try {
-      const item = await graphJson<DriveItemMeta>(graph, token, lookup);
+      // A missing folder answers 404; that is the normal path, not an error.
+      const item = await graphJson<DriveItemMeta>(graph, token, lookup, { quietStatuses: [404] });
       if (item.folder === undefined) {
         throw new FileOpsError(
           `"${name}" in folder ${parentItemId} is a file, not a folder. Nothing was written.`
